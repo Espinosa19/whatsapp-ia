@@ -1,0 +1,169 @@
+{
+  "info": {
+    "name": "WhatsApp AI Bot - Postman Collection",
+    "description": "Colección de pruebas para el bot de IA con WhatsApp",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Chat - Mensaje Simple",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"message\": \"¿Hola, cómo estás?\",\n  \"history\": []\n}"
+        },
+        "url": {
+          "raw": "http://localhost:3000/chat",
+          "protocol": "http",
+          "host": [
+            "localhost"
+          ],
+          "port": "3000",
+          "path": [
+            "chat"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Chat - Con Historial",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"message\": \"¿Y cuál es tu nombre?\",\n  \"history\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Hola\"\n    },\n    {\n      \"role\": \"assistant\",\n      \"content\": \"¡Hola! Soy un asistente de IA. ¿En qué puedo ayudarte?\"\n    }\n  ]\n}"
+        },
+        "url": {
+          "raw": "http://localhost:3000/chat",
+          "protocol": "http",
+          "host": [
+            "localhost"
+          ],
+          "port": "3000",
+          "path": [
+            "chat"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Chat - Error (Sin mensaje)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"message\": \"\",\n  \"history\": []\n}"
+        },
+        "url": {
+          "raw": "http://localhost:3000/chat",
+          "protocol": "http",
+          "host": [
+            "localhost"
+          ],
+          "port": "3000",
+          "path": [
+            "chat"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Webhook - Verificación",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "http://localhost:3000/webhook?hub.mode=subscribe&hub.verify_token=Constructumex&hub.challenge=test_challenge_value",
+          "protocol": "http",
+          "host": [
+            "localhost"
+          ],
+          "port": "3000",
+          "path": [
+            "webhook"
+          ],
+          "query": [
+            {
+              "key": "hub.mode",
+              "value": "subscribe"
+            },
+            {
+              "key": "hub.verify_token",
+              "value": "Constructumex"
+            },
+            {
+              "key": "hub.challenge",
+              "value": "test_challenge_value"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Webhook - Mensaje de WhatsApp",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json",
+            "type": "text"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"object\": \"whatsapp_business_account\",\n  \"entry\": [\n    {\n      \"id\": \"1381946793669697\",\n      \"changes\": [\n        {\n          \"value\": {\n            \"messaging_product\": \"whatsapp\",\n            \"metadata\": {\n              \"display_phone_number\": \"5491234567890\",\n              \"phone_number_id\": \"105692129484\"\n            },\n            \"messages\": [\n              {\n                \"from\": \"5491234567890\",\n                \"id\": \"wamid.HBEUGoMBMgIXAgo\",\n                \"timestamp\": \"1671881050\",\n                \"text\": {\n                  \"body\": \"Hola, necesito ayuda con mi pedido\"\n                },\n                \"type\": \"text\"\n              }\n            ]\n          },\n          \"field\": \"messages\"\n        }\n      ]\n    }\n  ]\n}"
+        },
+        "url": {
+          "raw": "http://localhost:3000/webhook",
+          "protocol": "http",
+          "host": [
+            "localhost"
+          ],
+          "port": "3000",
+          "path": [
+            "webhook"
+          ]
+        }
+      }
+    },
+    {
+      "name": "Health Check",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "http://localhost:3000/",
+          "protocol": "http",
+          "host": [
+            "localhost"
+          ],
+          "port": "3000",
+          "path": [
+            ""
+          ]
+        }
+      }
+    }
+  ]
+}
