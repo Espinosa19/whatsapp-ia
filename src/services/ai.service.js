@@ -20,6 +20,25 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
       reservationData = await detectAndExtractReservationData(userMessage, conversationHistory);
       console.log('📋 Datos de reservación extraídos:', JSON.stringify(reservationData, null, 2));
       console.log('📋 shouldReserve =', reservationData?.shouldReserve);
+      
+      // Si falta información pero es una solicitud clara
+      if (reservationData && !reservationData.shouldReserve && reservationData.missingData?.length > 0) {
+        console.log('⚠️ Reservación incompleta, pidiendo datos faltantes:', reservationData.missingData);
+        
+        // Generar respuesta pidiendo datos específicos
+        const missingDataText = reservationData.missingData
+          .map((item, idx) => `${idx + 1}. ${item}`)
+          .join('\n');
+          
+        const incompleteResponse = `
+Para poder agendar tu visita técnica, necesito que me proporciones la siguiente información:
+
+${missingDataText}
+
+¿Puedes decirme estos datos? 😊
+`;
+        return incompleteResponse;
+      }
     } else {
       console.log('ℹ️ Tipo de servicio NO es "servicio", es:', analysis.tipo_servicio);
     }
@@ -48,7 +67,7 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
 
   } catch (error) {
     console.error('❌ Error IA:', error);
-    return 'Lo siento, ocurrió un error.';
+    return 'Lo siento, ocurrió un error. Por favor intenta de nuevo.';
   }
 }
 
@@ -244,150 +263,201 @@ Responde como asesor de ventas experto.
     console.error('❌ Error respuesta:', error);
     return 'Ocurrió un error al generar la respuesta.';
   }
-}
-
-/**
- * Detecta si el usuario quiere hacer una reservación de visita técnica
- * Extrae los datos necesarios del mensaje y el historial de conversación
+}/**
+ * ============================
+ * 🤖 EXTRAER DATOS CON IA
+ * ============================
  */
 export async function detectAndExtractReservationData(userMessage, conversationHistory = []) {
   try {
     const openai = getOpenAIInstance();
 
-    // Construir el historial de conversación para contexto
     const historyText = conversationHistory
-      .slice(-4) // Últimos 4 mensajes
+      .slice(-6)
       .map(msg => `${msg.role}: ${msg.content}`)
       .join('\n');
 
-    // Obtener fecha de hoy para cálculos de fechas relativas
     const today = new Date();
-    const todayStr = today.toISOString().split('T')[0]; // YYYY-MM-DD
-    today.setDate(today.getDate() + 1);
-    const tomorrowStr = today.toISOString().split('T')[0]; // YYYY-MM-DD
+    const todayStr = today.toISOString().split('T')[0];
+
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const tomorrowStr = tomorrow.toISOString().split('T')[0];
 
     const prompt = `
-Analiza si el usuario está solicitando una visita técnica y extrae los datos.
+Analiza si el usuario quiere una visita técnica.
 
-FECHA ACTUAL: ${todayStr}
-MAÑANA SERÍA: ${tomorrowStr}
+FECHA HOY: ${todayStr}
+MAÑANA: ${tomorrowStr}
 
-Mensaje actual: "${userMessage}"
+HORARIO DE ATENCIÓN: 9 AM a 7 PM
+BLOQUES DE 1 HORA: 9:00, 10:00, 11:00, 12:00, 13:00, 14:00, 15:00, 16:00, 17:00, 18:00, 19:00
 
-Contexto previo:
+Mensaje: "${userMessage}"
+
+Contexto:
 ${historyText}
 
-Responde SOLO en JSON con este formato:
+Responde SOLO JSON:
 
 {
   "shouldReserve": true/false,
   "confidence": 0.0-1.0,
-  "clientName": "nombre del cliente o null",
-  "clientPhone": "número telefónico o null",
-  "clientEmail": "email o null",
-  "serviceType": "instalación|reparación|diagnóstico|otro o null",
-  "address": "dirección o null",
-  "preferredDate": "YYYY-MM-DD o null",
-  "preferredTime": "HH:mm o null",
-  "notes": "notas adicionales o null",
-  "missingData": ["lista de datos que faltan para completar la reservación"]
+  "clientName": "string|null",
+  "clientPhone": "string|null",
+  "clientEmail": "string|null",
+  "serviceType": "string|null",
+  "city": "Ciudad de México|null",
+  "address": "string|null",
+  "preferredDate": "YYYY-MM-DD|null",
+  "preferredTime": "HH:mm|null (SOLO bloques: 09:00, 10:00, 11:00, ... 19:00)",
+  "notes": "string|null"
 }
 
-Reglas IMPORTANTES:
-- shouldReserve = true solo si hay solicitud clara de visita técnica
-- Confidence > 0.7 indica seguridad alta
-- SIEMPRE retorna preferredDate en formato YYYY-MM-DD (nunca texto como "mañana")
-- Si dice "mañana" → usar ${tomorrowStr}
-- Si dice "próxima semana" → sumar 7 días a hoy
-- Si dice "el miércoles" → calcular el próximo miércoles
-- Si dice "esta tarde" → preferredTime = "14:00"
-- Si dice "a las 10 AM" → preferredTime = "10:00"
-- Si no está claro la hora, deja en null
-- Extrae datos que están explícitos o pueden inferirse del contexto
-- Si falta fecha u hora, agrega a missingData
-- El teléfono debe ser solo números
-- El email debe ser válido
+REGLAS:
+- "mañana" → ${tomorrowStr}
+- IMPORTANTE: La hora debe ser EXACTA en bloques de hora (09:00, 10:00, etc.)
+- La hora DEBE estar entre 9 AM (09:00) y 7 PM (19:00)
+- NO aceptar horarios como 14:30, 15:45, etc.
+- Si el usuario dice "2 PM", convertir a 14:00
+- Si dice "tarde", sugerir 14:00 o 15:00
+- Detectar CDMX por CP o alcaldía
+- Extraer nombre del contexto si no viene
 `;
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
-        { role: 'system', content: 'Eres experto en extracción de datos de conversaciones. SIEMPRE retorna fechas en formato YYYY-MM-DD, nunca texto.' },
+        { role: 'system', content: 'Responde SOLO JSON válido.' },
         { role: 'user', content: prompt }
       ],
-      temperature: 0.3,
-      max_tokens: 400,
+      temperature: 0.2,
     });
 
     let text = completion.choices[0].message.content.trim();
+    text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
 
-    try {
-      // Limpiar backticks y markdown si OpenAI retorna el JSON así
-      text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-      
-      // Intentar extraer JSON si está dentro de texto
-      const jsonMatch = text.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        text = jsonMatch[0];
-      }
-      
-      const data = JSON.parse(text);
-      console.log('📅 Análisis de reservación:', data);
-      return data;
-    } catch (parseError) {
-      console.warn('⚠️ No se pudo parsear la respuesta de reservación:', text);
-      console.error('Error al parsear:', parseError.message);
-      return { shouldReserve: false };
-    }
+    if (!text.startsWith('{')) throw new Error('No JSON');
+
+    return JSON.parse(text);
 
   } catch (error) {
-    console.error('❌ Error detectando reservación:', error);
+    console.error('❌ Error IA:', error);
     return { shouldReserve: false };
   }
 }
 
 /**
+ * ============================
+ * 🔐 VALIDAR Y FORMATEAR DATOS
+ * ============================
  * Valida y formatea datos de reservación antes de ser guardados
  */
-export function validateAndFormatReservationData(data) {
+export function validateAndFormatReservationData(data, existingAppointments = []) {
   try {
     console.log('🔐 Iniciando validación de datos de reservación:', data);
     
-    // Validar datos requeridos
-    if (!data.clientName || !data.serviceType || !data.address) {
-      console.warn('⚠️ Faltan datos requeridos');
+    // ✅ 1. Validar que sea Ciudad de México
+    console.log('🌍 Verificando localización...');
+    if (!data.city) {
+      console.warn('⚠️ Falta información de la ciudad');
       return {
         valid: false,
-        error: 'Faltan datos requeridos: clientName, serviceType, address',
+        error: '❌ Necesito saber en qué ciudad es el servicio. ¿Es en la Ciudad de México (CDMX)?',
+        missingData: ['Ciudad']
       };
     }
-
-    // Validar que la fecha y hora estén disponibles
+    
+    const cityNormalized = data.city.toLowerCase().trim();
+    const isValidCity = cityNormalized.includes('cdmx') || 
+                        cityNormalized.includes('ciudad de méxico') || 
+                        cityNormalized.includes('mexico city');
+    
+    if (!isValidCity) {
+      console.warn(`❌ Ciudad no permitida: ${data.city}`);
+      return {
+        valid: false,
+        error: `⚠️ Por ahora solo atendemos servicios en la Ciudad de México (CDMX). Mencionaste: ${data.city}. ¿Tu ubicación está en CDMX?`,
+      };
+    }
+    console.log('✅ Ciudad validada: CDMX ✓');
+    
+    // ✅ 2. Validar nombre del cliente
+    console.log('👤 Validando nombre...');
+    if (!data.clientName || data.clientName.trim().length === 0) {
+      console.warn('⚠️ Falta nombre del cliente');
+      return {
+        valid: false,
+        error: '❌ Necesito tu nombre completo para la reservación',
+        missingData: ['Nombre completo']
+      };
+    }
+    console.log('✅ Nombre validado:', data.clientName);
+    
+    // ✅ 3. Validar tipo de servicio
+    console.log('🔧 Validando tipo de servicio...');
+    if (!data.serviceType || data.serviceType.trim().length === 0) {
+      console.warn('⚠️ Falta tipo de servicio');
+      return {
+        valid: false,
+        error: '❌ ¿Qué tipo de servicio necesitas? (instalación, reparación, diagnóstico, etc.)',
+        missingData: ['Tipo de servicio']
+      };
+    }
+    console.log('✅ Servicio validado:', data.serviceType);
+    
+    // ✅ 4. Validar dirección (CRÍTICA - debe ser específica)
+    console.log('🏠 Validando dirección...');
+    if (!data.address || data.address.trim().length < 5) {
+      console.warn('⚠️ Dirección insuficiente:', data.address);
+      return {
+        valid: false,
+        error: '❌ Necesito una dirección específica. Por favor incluye: calle, número, colonia y delegación.',
+        missingData: ['Dirección específica']
+      };
+    }
+    
+    // Detectar direcciones vagas
+    const vaguePhrases = ['en mi casa', 'en el trabajo', 'en casa', 'aqui', 'ahi', 'en el local', 'en mi lugar'];
+    const addressLower = data.address.toLowerCase().trim();
+    
+    if (vaguePhrases.some(phrase => addressLower.includes(phrase)) || addressLower.split(' ').length < 3) {
+      console.warn('⚠️ Dirección muy vaga:', data.address);
+      return {
+        valid: false,
+        error: `❌ La dirección "${data.address}" es demasiado vaga. Necesito: **calle, número, colonia y delegación** (ej: "Avenida Paseo de la Reforma 505, Cuauhtémoc")`,
+        missingData: ['Dirección específica con calle, número, colonia y delegación']
+      };
+    }
+    
+    console.log('✅ Dirección validada:', data.address);
+    
+    // ✅ 5. Validar que la fecha y hora estén disponibles
+    console.log('📅 Validando fecha y hora...');
     if (!data.preferredDate || !data.preferredTime) {
       console.warn('⚠️ Faltan datos de fecha/hora:', { date: data.preferredDate, time: data.preferredTime });
       return {
         valid: false,
-        error: 'Faltan datos de fecha/hora para la reservación',
+        error: '❌ Necesito saber cuándo deseas el servicio. Por favor especifica una fecha y hora.',
         missingData: [
-          !data.preferredDate ? 'Fecha preferida' : '',
-          !data.preferredTime ? 'Hora preferida' : ''
+          !data.preferredDate ? '📅 Fecha preferida (ej: 2026-04-22)' : '',
+          !data.preferredTime ? '⏰ Hora preferida (ej: 14:00)' : ''
         ].filter(x => x)
       };
     }
-
-    // Parsear fecha y hora
+    
+    // ✅ 6. Parsear y validar fecha y hora
     let dateTime = null;
     try {
       console.log(`📅 Parseando fecha: ${data.preferredDate} y hora: ${data.preferredTime}`);
       
       // ⚠️ IMPORTANTE: Parsear la fecha en zona horaria LOCAL, no en UTC
-      // Esto evita problemas con desplazamientos de zona horaria
       const [year, month, day] = data.preferredDate.split('-');
       const date = new Date(parseInt(year), parseInt(month) - 1, parseInt(day));
       
       // Validar que la fecha sea válida
       if (isNaN(date.getTime())) {
-        throw new Error('Fecha inválida');
+        throw new Error('Formato de fecha inválido. Debe ser YYYY-MM-DD');
       }
       
       const [hours, minutes] = data.preferredTime.split(':');
@@ -396,15 +466,28 @@ export function validateAndFormatReservationData(data) {
       
       console.log(`⏰ Horas: ${parsedHours}, Minutos: ${parsedMinutes}`);
       
+      // ✅ NUEVA VALIDACIÓN: Solo bloques de 1 hora (minutos = 00)
+      if (parsedMinutes !== 0) {
+        console.warn('⚠️ Minutos no son 00:', parsedMinutes);
+        throw new Error(`Las citas deben ser en bloques de 1 hora exacta (9:00, 10:00, etc.). No se permiten horarios como ${parsedHours}:${String(parsedMinutes).padStart(2, '0')}`);
+      }
+      
+      // ✅ NUEVA VALIDACIÓN: Horario de atención 9 AM a 7 PM
+      if (parsedHours < 9 || parsedHours > 19) {
+        console.warn('⚠️ Hora fuera del horario de atención:', parsedHours);
+        const availableHours = '9:00, 10:00, 11:00, 12:00, 13:00, 14:00, 15:00, 16:00, 17:00, 18:00, 19:00';
+        throw new Error(`El horario de atención es de 9:00 AM a 7:00 PM. Horarios disponibles: ${availableHours}`);
+      }
+      
       // Validar horas y minutos
       if (isNaN(parsedHours) || isNaN(parsedMinutes) || parsedHours < 0 || parsedHours > 23 || parsedMinutes < 0 || parsedMinutes > 59) {
-        throw new Error('Hora inválida: debe ser HH:mm en formato 24 horas');
+        throw new Error('Hora inválida: debe ser HH:mm en formato 24 horas (ej: 14:00)');
       }
       
       date.setHours(parsedHours, parsedMinutes, 0, 0);
       dateTime = date;
       
-      console.log(`✅ Fecha/hora parseada: ${dateTime.toISOString()}`);
+      console.log(`✅ Fecha/hora parseada correctamente: ${dateTime.toISOString()}`);
       
       // Validar que la fecha no esté en el pasado
       const now = new Date();
@@ -412,7 +495,7 @@ export function validateAndFormatReservationData(data) {
         console.warn(`⚠️ Fecha en el pasado: ${dateTime} < ${now}`);
         return {
           valid: false,
-          error: 'La fecha/hora no puede ser en el pasado',
+          error: '❌ La fecha y hora que especificaste ya pasaron. Por favor elige una fecha futura.',
         };
       }
       
@@ -420,10 +503,69 @@ export function validateAndFormatReservationData(data) {
       console.error('❌ Error parseando fecha/hora:', error);
       return {
         valid: false,
-        error: `Formato de fecha/hora inválido: ${error.message}. Usa YYYY-MM-DD para fecha y HH:mm para hora`,
+        error: `❌ ${error.message}`,
       };
     }
 
+    // ✅ 7. NUEVA VALIDACIÓN: Verificar que no exista otra cita en la misma hora
+    console.log('🔄 Verificando disponibilidad de horario...');
+    if (existingAppointments && existingAppointments.length > 0) {
+      const BUFFER = 60 * 60 * 1000; // 1 hora de buffer
+      const requestedTime = dateTime.getTime();
+      
+      const conflictingAppointment = existingAppointments.find(appt => {
+        const existingTime = new Date(appt.dateTime).getTime();
+        const timeDifference = Math.abs(existingTime - requestedTime);
+        return timeDifference < BUFFER;
+      });
+      
+      if (conflictingAppointment) {
+        console.warn('❌ Horario ocupado:', {
+          solicitado: dateTime.toLocaleString('es-MX'),
+          existente: new Date(conflictingAppointment.dateTime).toLocaleString('es-MX')
+        });
+        
+        // Sugerir próximo horario disponible (solo bloques válidos entre 9-19)
+        let suggestedTime = new Date(dateTime);
+        let found = false;
+        
+        for (let i = 1; i <= 10; i++) {
+          suggestedTime.setHours(suggestedTime.getHours() + 1);
+          
+          // Solo considerar si está dentro del horario 9-19
+          if (suggestedTime.getHours() < 9 || suggestedTime.getHours() > 19) {
+            continue;
+          }
+          
+          const suggestedTimeMs = suggestedTime.getTime();
+          
+          const isAvailable = !existingAppointments.some(appt => {
+            const existingTime = new Date(appt.dateTime).getTime();
+            return Math.abs(existingTime - suggestedTimeMs) < BUFFER;
+          });
+          
+          if (isAvailable) {
+            found = true;
+            break;
+          }
+        }
+        
+        const suggestedTimeStr = found 
+          ? suggestedTime.toLocaleString('es-MX', { dateStyle: 'medium', timeStyle: 'short' })
+          : 'próximamente';
+        
+        return {
+          valid: false,
+          error: `⚠️ Ese horario ya está ocupado.\n\nTe propongo: ${suggestedTimeStr}\n\n¿Te funciona ese horario?`,
+          conflict: true,
+          suggestedDateTime: found ? suggestedTime.toISOString() : null
+        };
+      }
+      
+      console.log('✅ Horario disponible ✓');
+    }
+
+    console.log('✅ TODAS LAS VALIDACIONES PASARON');
     return {
       valid: true,
       formatted: {
@@ -432,6 +574,7 @@ export function validateAndFormatReservationData(data) {
         clientEmail: data.clientEmail || '',
         serviceType: data.serviceType,
         address: data.address,
+        city: data.city,
         dateTime: dateTime.toISOString(),
         notes: data.notes || '',
         duration: 60, // Duración por defecto
@@ -444,4 +587,105 @@ export function validateAndFormatReservationData(data) {
       error: error.message,
     };
   }
+}
+
+// Alias para compatibilidad
+export const validateReservationData = validateAndFormatReservationData;
+
+/**
+ * ============================
+ * ⏱️ VALIDAR DISPONIBILIDAD
+ * ============================
+ */
+function isTimeSlotAvailable(dateTime, existingAppointments = []) {
+  const requested = new Date(dateTime).getTime();
+  const BUFFER = 60 * 60 * 1000;
+
+  return !existingAppointments.some(appt => {
+    const existing = new Date(appt.dateTime).getTime();
+    return Math.abs(existing - requested) < BUFFER;
+  });
+}
+
+/**
+ * ============================
+ * 🔁 SUGERIR NUEVO HORARIO
+ * ============================
+ */
+function suggestNextAvailableSlot(dateTime, existingAppointments = []) {
+  let newDate = new Date(dateTime);
+
+  for (let i = 1; i <= 5; i++) {
+    newDate.setHours(newDate.getHours() + 1);
+
+    if (isTimeSlotAvailable(newDate, existingAppointments)) {
+      return newDate;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * ============================
+ * 💬 MENSAJES
+ * ============================
+ */
+function formatDate(date) {
+  return date.toLocaleString('es-MX', {
+    dateStyle: 'medium',
+    timeStyle: 'short'
+  });
+}
+
+function buildSuccessMessage(appt) {
+  return `✅ ¡Cita confirmada!
+
+📅 ${formatDate(new Date(appt.dateTime))}
+📍 ${appt.address}
+
+¡Te esperamos! 🛠️`;
+}
+
+function buildConflictMessage(original, newSlot) {
+  return `⚠️ Ese horario ya está ocupado.
+
+📅 Tu solicitud: ${formatDate(new Date(original.dateTime))}
+
+Te propongo:
+👉 ${formatDate(newSlot)}
+
+¿Te funciona ese horario? 😊`;
+}
+
+/**
+ * ============================
+ * 🎯 FLUJO PRINCIPAL
+ * ============================
+ */
+export async function processReservation(userMessage, history, existingAppointments = []) {
+  // 1. Extraer datos
+  const data = await detectAndExtractReservationData(userMessage, history);
+
+  // 2. Validar (ahora con validación de disponibilidad de horario)
+  const validation = validateAndFormatReservationData(data, existingAppointments);
+
+  if (!validation.valid) {
+    return {
+      success: false,
+      message: validation.error,
+      missingData: validation.missingData || [],
+      conflict: validation.conflict || false,
+      suggestedDateTime: validation.suggestedDateTime || null
+    };
+  }
+
+  const appointment = validation.formatted;
+
+  // 3. Confirmar
+  return {
+    success: true,
+    appointment,
+    message: `✅ ¡Cita confirmada!\n\n📅 ${new Date(appointment.dateTime).toLocaleString('es-MX')}\n📍 ${appointment.address}\n\n¡Te esperamos! 🛠️`
+  };
 }

@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { generateAIResponse, validateAndFormatReservationData } from '../services/ai.service.js';
-import { createReservation } from '../services/reservation.service.js';
+import { createReservation, getUserReservations } from '../services/reservation.service.js';
 import { 
   getConversationHistory, 
   saveMessageToHistory,
@@ -71,7 +71,15 @@ export const receiveMessage = async (req, res) => {
       // 📅 Procesar solicitud de reservación
       if (aiResponse.reservationData && aiResponse.reservationData.shouldReserve) {
         console.log('✅ shouldReserve es true, validando datos...');
-        const validation = validateAndFormatReservationData(aiResponse.reservationData);
+        
+        // Obtener citas existentes del usuario para validar disponibilidad
+        const existingReservations = await getUserReservations(from);
+        console.log(`📊 Citas existentes del usuario: ${existingReservations.length}`);
+        
+        const validation = validateAndFormatReservationData(
+          aiResponse.reservationData,
+          existingReservations
+        );
         console.log('📝 Resultado de validación:', validation);
         
         if (validation.valid) {
@@ -95,13 +103,13 @@ export const receiveMessage = async (req, res) => {
             reply += `Error: ${reservationResult.error}`;
           }
         } else {
+          // ❌ VALIDACIÓN FALLÓ - No usar la respuesta de IA, solo mostrar el error
           console.warn('⚠️ Validación falló:', validation.error);
-          // Validación falló - mostrar error al usuario
-          reply += `\n\n⚠️ *No se pudo completar la reservación*\n`;
-          reply += `Problema: ${validation.error}\n`;
+          // Reemplazar completamente la respuesta anterior con solo el error
+          reply = validation.error;
           
           if (validation.missingData && validation.missingData.length > 0) {
-            reply += `\nNecesito que me proporciones:\n`;
+            reply += `\n\nNecesito que me proporciones:\n`;
             validation.missingData.forEach((item, index) => {
               reply += `${index + 1}. ${item}\n`;
             });

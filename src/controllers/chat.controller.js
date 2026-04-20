@@ -1,6 +1,6 @@
 import { generateAIResponse } from '../services/ai.service.js';
 import { validateAndFormatReservationData } from '../services/ai.service.js';
-import { createReservation } from '../services/reservation.service.js';
+import { createReservation, getUserReservations } from '../services/reservation.service.js';
 import {
   getConversationHistory,
   saveMessageToHistory,
@@ -56,10 +56,19 @@ export const chatWithAI = async (req, res) => {
       // 📅 Procesar solicitud de reservación
       if (aiResponse.reservationData && aiResponse.reservationData.shouldReserve) {
         console.log('✅ shouldReserve es true, validando datos...');
-        const validation = validateAndFormatReservationData(aiResponse.reservationData);
+        
+        // Obtener citas existentes del usuario para validar disponibilidad
+        const existingReservations = await getUserReservations(userIdentifier);
+        console.log(`📊 Citas existentes del usuario: ${existingReservations.length}`);
+        
+        const validation = validateAndFormatReservationData(
+          aiResponse.reservationData,
+          existingReservations
+        );
         console.log('📝 Resultado de validación:', validation);
         
         if (validation.valid) {
+          // ✅ VALIDACIÓN PASÓ - Crear reservación
           console.log('✅ Validación exitosa, creando reservación...');
           reservationResult = await createReservation({
             userId: userIdentifier,
@@ -80,13 +89,13 @@ export const chatWithAI = async (req, res) => {
             response += `Error: ${reservationResult.error}`;
           }
         } else {
+          // ❌ VALIDACIÓN FALLÓ - No usar la respuesta de IA, solo mostrar el error
           console.warn('⚠️ Validación falló:', validation.error);
-          // Validación falló - mostrar error al usuario
-          response += `\n\n⚠️ *No se pudo completar la reservación*\n`;
-          response += `Problema: ${validation.error}\n`;
+          // Reemplazar completamente la respuesta anterior con solo el error
+          response = validation.error;
           
           if (validation.missingData && validation.missingData.length > 0) {
-            response += `\nNecesito que me proporciones:\n`;
+            response += `\n\nNecesito que me proporciones:\n`;
             validation.missingData.forEach((item, index) => {
               response += `${index + 1}. ${item}\n`;
             });
