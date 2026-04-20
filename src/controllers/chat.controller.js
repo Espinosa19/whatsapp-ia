@@ -1,4 +1,6 @@
 import { generateAIResponse } from '../services/ai.service.js';
+import { validateAndFormatReservationData } from '../services/ai.service.js';
+import { createReservation } from '../services/reservation.service.js';
 import {
   getConversationHistory,
   saveMessageToHistory,
@@ -32,10 +34,71 @@ export const chatWithAI = async (req, res) => {
     }
 
     // 🤖 Generar respuesta
-    const response = await generateAIResponse({
+    const aiResponse = await generateAIResponse({
       userMessage: message,
       conversationHistory: conversationHistory,
     });
+
+    console.log('📤 Respuesta de IA recibida:');
+    console.log('   - Tipo:', typeof aiResponse);
+    console.log('   - Es objeto:', typeof aiResponse === 'object');
+    console.log('   - Tiene reservationRequest:', aiResponse?.reservationRequest);
+    console.log('   - Contenido:', JSON.stringify(aiResponse, null, 2).substring(0, 500));
+
+    // Extraer respuesta y datos de reservación si existen
+    let response = aiResponse;
+    let reservationResult = null;
+
+    if (typeof aiResponse === 'object' && aiResponse.reservationRequest) {
+      console.log('🔄 Procesando solicitud de reservación');
+      response = aiResponse.reply;
+      
+      // 📅 Procesar solicitud de reservación
+      if (aiResponse.reservationData && aiResponse.reservationData.shouldReserve) {
+        console.log('✅ shouldReserve es true, validando datos...');
+        const validation = validateAndFormatReservationData(aiResponse.reservationData);
+        console.log('📝 Resultado de validación:', validation);
+        
+        if (validation.valid) {
+          console.log('✅ Validación exitosa, creando reservación...');
+          reservationResult = await createReservation({
+            userId: userIdentifier,
+            ...validation.formatted,
+          });
+          console.log('📅 Resultado de creación:', reservationResult);
+
+          if (reservationResult.success) {
+            console.log('🎉 ¡Reservación creada exitosamente!');
+            response += `\n\n✅ *RESERVACIÓN CONFIRMADA*\n`;
+            response += `📅 Fecha: ${new Date(reservationResult.reservation.dateTime).toLocaleDateString('es-MX')}\n`;
+            response += `⏰ Hora: ${new Date(reservationResult.reservation.dateTime).toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' })}\n`;
+            response += `📍 Ubicación: ${reservationResult.reservation.address}\n`;
+            response += `🔗 Link: ${reservationResult.eventLink}`;
+          } else {
+            console.error('❌ Error creando reservación:', reservationResult.error);
+            response += `\n\n❌ *No se pudo crear la reservación*\n`;
+            response += `Error: ${reservationResult.error}`;
+          }
+        } else {
+          console.warn('⚠️ Validación falló:', validation.error);
+          // Validación falló - mostrar error al usuario
+          response += `\n\n⚠️ *No se pudo completar la reservación*\n`;
+          response += `Problema: ${validation.error}\n`;
+          
+          if (validation.missingData && validation.missingData.length > 0) {
+            response += `\nNecesito que me proporciones:\n`;
+            validation.missingData.forEach((item, index) => {
+              response += `${index + 1}. ${item}\n`;
+            });
+          }
+        }
+      } else if (aiResponse.reservationData && aiResponse.reservationData.missingData && aiResponse.reservationData.missingData.length > 0) {
+        response += `\n\n📋 Para completar tu reservación, necesito que me proporciones:\n`;
+        aiResponse.reservationData.missingData.forEach((item, index) => {
+          response += `${index + 1}. ${item}\n`;
+        });
+      }
+    }
 
     // 💾 Guardar respuesta de la IA
     await saveMessageToHistory(userIdentifier, 'assistant', response);
@@ -44,6 +107,11 @@ export const chatWithAI = async (req, res) => {
       reply: response,
       userId: userIdentifier,
       historySize: conversationHistory.length,
+      reservation: reservationResult ? {
+        success: reservationResult.success,
+        eventId: reservationResult.eventId,
+        eventLink: reservationResult.eventLink,
+      } : null,
     });
   } catch (error) {
     console.error('❌ Error en Chat Controller:', error);

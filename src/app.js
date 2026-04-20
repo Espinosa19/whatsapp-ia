@@ -5,6 +5,7 @@ import helmet from 'helmet';
 import chatRoutes from './routes/chat.routes.js';
 import webhookRoutes from './routes/webhook.routes.js';
 import adminRoutes from './routes/admin.routes.js';
+import reservationRoutes from './routes/reservation.routes.js';
 
 const app = express();
 
@@ -20,6 +21,9 @@ app.use('/webhook', webhookRoutes);
 
 // 🔹 Rutas de administración
 app.use('/admin', adminRoutes);
+
+// 🔹 Rutas de reservaciones
+app.use('/reservations', reservationRoutes);
 
 // 🔹 Health check
 app.get('/', (req, res) => {

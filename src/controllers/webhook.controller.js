@@ -1,5 +1,6 @@
 import axios from 'axios';
-import { generateAIResponse } from '../services/ai.service.js';
+import { generateAIResponse, validateAndFormatReservationData } from '../services/ai.service.js';
+import { createReservation } from '../services/reservation.service.js';
 import { 
   getConversationHistory, 
   saveMessageToHistory,
@@ -49,13 +50,74 @@ export const receiveMessage = async (req, res) => {
     const formattedHistory = formatHistoryForOpenAI(history);
 
     // 🤖 Generar respuesta con historial completo
-    const aiReply = await generateAIResponse({
+    const aiResponse = await generateAIResponse({
       userMessage: text,
       conversationHistory: formattedHistory,
     });
 
+    console.log('📤 Respuesta de IA recibida en webhook:');
+    console.log('   - Tipo:', typeof aiResponse);
+    console.log('   - Es objeto:', typeof aiResponse === 'object');
+    console.log('   - Tiene reservationRequest:', aiResponse?.reservationRequest);
+
+    // Extraer respuesta y datos de reservación si existen
+    let reply = aiResponse;
+    let reservationResult = null;
+
+    if (typeof aiResponse === 'object' && aiResponse.reservationRequest) {
+      console.log('🔄 Procesando solicitud de reservación desde WhatsApp');
+      reply = aiResponse.reply;
+      
+      // 📅 Procesar solicitud de reservación
+      if (aiResponse.reservationData && aiResponse.reservationData.shouldReserve) {
+        console.log('✅ shouldReserve es true, validando datos...');
+        const validation = validateAndFormatReservationData(aiResponse.reservationData);
+        console.log('📝 Resultado de validación:', validation);
+        
+        if (validation.valid) {
+          console.log('✅ Validación exitosa, creando reservación...');
+          reservationResult = await createReservation({
+            userId: from,
+            ...validation.formatted,
+          });
+          console.log('📅 Resultado de creación:', reservationResult);
+
+          if (reservationResult.success) {
+            console.log('🎉 ¡Reservación creada exitosamente desde WhatsApp!');
+            reply += `\n\n✅ *RESERVACIÓN CONFIRMADA*\n`;
+            reply += `📅 Fecha: ${new Date(reservationResult.reservation.dateTime).toLocaleDateString('es-MX')}\n`;
+            reply += `⏰ Hora: ${new Date(reservationResult.reservation.dateTime).toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' })}\n`;
+            reply += `📍 Ubicación: ${reservationResult.reservation.address}\n`;
+            reply += `🔗 Link: ${reservationResult.eventLink}`;
+          } else {
+            console.error('❌ Error creando reservación:', reservationResult.error);
+            reply += `\n\n❌ *No se pudo crear la reservación*\n`;
+            reply += `Error: ${reservationResult.error}`;
+          }
+        } else {
+          console.warn('⚠️ Validación falló:', validation.error);
+          // Validación falló - mostrar error al usuario
+          reply += `\n\n⚠️ *No se pudo completar la reservación*\n`;
+          reply += `Problema: ${validation.error}\n`;
+          
+          if (validation.missingData && validation.missingData.length > 0) {
+            reply += `\nNecesito que me proporciones:\n`;
+            validation.missingData.forEach((item, index) => {
+              reply += `${index + 1}. ${item}\n`;
+            });
+          }
+        }
+      } else if (aiResponse.reservationData && aiResponse.reservationData.missingData && aiResponse.reservationData.missingData.length > 0) {
+        reply += `\n\n📋 Para completar tu reservación, necesito que me proporciones:\n`;
+        aiResponse.reservationData.missingData.forEach((item, index) => {
+          reply += `${index + 1}. ${item}\n`;
+        });
+      }
+    }
+      
+
     // 💾 Guardar respuesta de la IA
-    await saveMessageToHistory(from, 'assistant', aiReply);
+    await saveMessageToHistory(from, 'assistant', reply);
 
     // 📤 Enviar respuesta a WhatsApp
     await axios.post(
@@ -63,7 +125,7 @@ export const receiveMessage = async (req, res) => {
       {
         messaging_product: 'whatsapp',
         to: from,
-        text: { body: aiReply },
+        text: { body: reply },
       },
       {
         headers: {

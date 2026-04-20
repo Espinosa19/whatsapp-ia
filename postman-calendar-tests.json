@@ -1,0 +1,205 @@
+{
+  "info": {
+    "name": "WhatsApp AI Bot - Google Calendar Integration",
+    "description": "Postman collection for testing Google Calendar reservation endpoints",
+    "version": "1.0.0"
+  },
+  "item": [
+    {
+      "name": "Chat - Solicitar Visita Técnica",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"userId\": \"whatsapp-51234567890\",\n  \"message\": \"Hola, necesito una visita técnica de instalación para mañana a las 10 de la mañana. Soy Juan García, mi número es 5551234567 y la dirección es Calle Principal 123, Apartamento 5. Mi email es juan@email.com\"\n}"
+        },
+        "url": {
+          "raw": "http://localhost:3000/chat",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "3000",
+          "path": ["chat"]
+        }
+      },
+      "description": "Test automatic reservation detection and creation"
+    },
+    {
+      "name": "Reservaciones - Crear Manual",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"userId\": \"whatsapp-51234567890\",\n  \"clientName\": \"Juan García\",\n  \"clientPhone\": \"5551234567\",\n  \"clientEmail\": \"juan@email.com\",\n  \"serviceType\": \"instalación\",\n  \"dateTime\": \"2024-01-25T10:00:00\",\n  \"duration\": 60,\n  \"address\": \"Calle Principal 123, Apartamento 5\",\n  \"notes\": \"Cliente necesita instalación urgente. Preferencia: mañana por la mañana\"\n}"
+        },
+        "url": {
+          "raw": "http://localhost:3000/reservations/book",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "3000",
+          "path": ["reservations", "book"]
+        }
+      },
+      "description": "Manually create a reservation without using chat"
+    },
+    {
+      "name": "Reservaciones - Ver del Usuario",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://localhost:3000/reservations/user?userId=whatsapp-51234567890",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "3000",
+          "path": ["reservations", "user"],
+          "query": [
+            {
+              "key": "userId",
+              "value": "whatsapp-51234567890"
+            }
+          ]
+        }
+      },
+      "description": "Get all reservations for a specific user"
+    },
+    {
+      "name": "Reservaciones - Horarios Disponibles",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://localhost:3000/reservations/available?date=2024-01-25&duration=60",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "3000",
+          "path": ["reservations", "available"],
+          "query": [
+            {
+              "key": "date",
+              "value": "2024-01-25",
+              "description": "Date in YYYY-MM-DD format"
+            },
+            {
+              "key": "duration",
+              "value": "60",
+              "description": "Duration in minutes"
+            }
+          ]
+        }
+      },
+      "description": "Get available time slots for a specific date"
+    },
+    {
+      "name": "Reservaciones - Estadísticas",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://localhost:3000/reservations/stats",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "3000",
+          "path": ["reservations", "stats"]
+        }
+      },
+      "description": "Get reservation statistics"
+    },
+    {
+      "name": "Reservaciones - Cancelar",
+      "request": {
+        "method": "DELETE",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"userId\": \"whatsapp-51234567890\"\n}"
+        },
+        "url": {
+          "raw": "http://localhost:3000/reservations/abc123xyz",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "3000",
+          "path": ["reservations", "abc123xyz"],
+          "description": "Replace 'abc123xyz' with the actual eventId from Google Calendar"
+        }
+      },
+      "description": "Cancel a specific reservation. Use the eventId returned from booking"
+    },
+    {
+      "name": "Chat - Conversación Normal",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"userId\": \"whatsapp-51234567890\",\n  \"message\": \"¿Cuál es el precio del equipo XYZ?\"\n}"
+        },
+        "url": {
+          "raw": "http://localhost:3000/chat",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "3000",
+          "path": ["chat"]
+        }
+      },
+      "description": "Test normal chat without reservation request"
+    },
+    {
+      "name": "Chat - Historial",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://localhost:3000/chat/history?userId=whatsapp-51234567890",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "3000",
+          "path": ["chat", "history"],
+          "query": [
+            {
+              "key": "userId",
+              "value": "whatsapp-51234567890"
+            }
+          ]
+        }
+      },
+      "description": "Get conversation history for a user"
+    },
+    {
+      "name": "Admin - Estadísticas",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://localhost:3000/admin/stats",
+          "protocol": "http",
+          "host": ["localhost"],
+          "port": "3000",
+          "path": ["admin", "stats"]
+        }
+      },
+      "description": "Get general chat statistics"
+    }
+  ]
+}
