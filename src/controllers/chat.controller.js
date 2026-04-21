@@ -7,6 +7,7 @@ import {
   formatHistoryForOpenAI,
   clearConversationHistory
 } from '../services/conversation.service.js';
+import { saveMessageToDB } from '../services/database.service.js';
 
 export const chatWithAI = async (req, res) => {
   const { message, history, userId } = req.body;
@@ -21,6 +22,8 @@ export const chatWithAI = async (req, res) => {
   try {
     // 💾 Guardar mensaje del usuario
     await saveMessageToHistory(userIdentifier, 'user', message);
+    // 💾 Guardar también en SQLite para la interfaz web
+    saveMessageToDB(userIdentifier, 'user', message);
 
     // 📚 Obtener historial (si no se envía, recuperar del archivo)
     let conversationHistory;
@@ -111,6 +114,8 @@ export const chatWithAI = async (req, res) => {
 
     // 💾 Guardar respuesta de la IA
     await saveMessageToHistory(userIdentifier, 'assistant', response);
+    // 💾 Guardar también en SQLite para la interfaz web
+    saveMessageToDB(userIdentifier, 'assistant', response);
 
     res.json({
       reply: response,

@@ -6,6 +6,7 @@ import chatRoutes from './routes/chat.routes.js';
 import webhookRoutes from './routes/webhook.routes.js';
 import adminRoutes from './routes/admin.routes.js';
 import reservationRoutes from './routes/reservation.routes.js';
+import databaseRoutes from './routes/database.routes.js';
 
 const app = express();
 
@@ -24,6 +25,9 @@ app.use('/admin', adminRoutes);
 
 // 🔹 Rutas de reservaciones
 app.use('/reservations', reservationRoutes);
+
+// 🔹 Rutas de base de datos (SQLite)
+app.use('/db', databaseRoutes);
 
 // 🔹 Health check
 app.get('/', (req, res) => {
