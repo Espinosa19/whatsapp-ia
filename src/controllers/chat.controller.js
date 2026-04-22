@@ -8,6 +8,7 @@ import {
   clearConversationHistory
 } from '../services/conversation.service.js';
 import { saveMessageToDB } from '../services/database.service.js';
+import { saveLead } from '../services/leads.service.js';
 
 export const chatWithAI = async (req, res) => {
   const { message, history, userId } = req.body;
@@ -81,6 +82,31 @@ export const chatWithAI = async (req, res) => {
 
           if (reservationResult.success) {
             console.log('🎉 ¡Reservación creada exitosamente!');
+            
+            // 🔥 GUARDAR LEAD CUANDO LA RESERVACIÓN ES EXITOSA
+            console.log('💾 Guardando lead...');
+            try {
+              saveLead({
+                userId: userIdentifier,
+                clientName: validation.formatted.clientName,
+                clientPhone: validation.formatted.clientPhone,
+                clientEmail: validation.formatted.clientEmail,
+                serviceType: validation.formatted.serviceType,
+                address: validation.formatted.address,
+                city: validation.formatted.city,
+                status: 'convertido', // Lead convertido a reservación
+                notes: validation.formatted.notes,
+                preferredDate: validation.formatted.dateTime.split('T')[0],
+                preferredTime: validation.formatted.dateTime.split('T')[1].substring(0, 5),
+                eventId: reservationResult.eventId,
+                calendarLink: reservationResult.eventLink,
+              });
+              console.log('✅ Lead guardado correctamente');
+            } catch (leadError) {
+              console.error('⚠️ Error guardando lead:', leadError.message);
+              // No fallar la reservación si hay error guardando lead
+            }
+            
             response += `\n\n✅ *RESERVACIÓN CONFIRMADA*\n`;
             response += `📅 Fecha: ${new Date(reservationResult.reservation.dateTime).toLocaleDateString('es-MX')}\n`;
             response += `⏰ Hora: ${new Date(reservationResult.reservation.dateTime).toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' })}\n`;

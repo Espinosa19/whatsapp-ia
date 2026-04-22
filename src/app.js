@@ -7,6 +7,7 @@ import webhookRoutes from './routes/webhook.routes.js';
 import adminRoutes from './routes/admin.routes.js';
 import reservationRoutes from './routes/reservation.routes.js';
 import databaseRoutes from './routes/database.routes.js';
+import leadsRoutes from './routes/leads.routes.js';
 
 const app = express();
 
@@ -28,6 +29,9 @@ app.use('/reservations', reservationRoutes);
 
 // 🔹 Rutas de base de datos (SQLite)
 app.use('/db', databaseRoutes);
+
+// 🔹 Rutas de leads
+app.use('/leads', leadsRoutes);
 
 // 🔹 Health check
 app.get('/', (req, res) => {

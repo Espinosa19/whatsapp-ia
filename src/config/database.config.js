@@ -59,6 +59,29 @@ function initializeTables() {
     )
   `);
 
+  // 🔥 NUEVA TABLA: LEADS
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS leads (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      client_name TEXT NOT NULL,
+      client_phone TEXT,
+      client_email TEXT,
+      service_type TEXT,
+      address TEXT,
+      city TEXT,
+      status TEXT DEFAULT 'nuevo',
+      notes TEXT,
+      preferred_date TEXT,
+      preferred_time TEXT,
+      event_id TEXT,
+      calendar_link TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, client_phone)
+    )
+  `);
+
   console.log('✅ Tablas SQLite inicializadas');
 }
 
