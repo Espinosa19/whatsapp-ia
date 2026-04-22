@@ -285,7 +285,7 @@ export async function detectAndExtractReservationData(userMessage, conversationH
     const tomorrowStr = tomorrow.toISOString().split('T')[0];
 
     const prompt = `
-Analiza si el usuario quiere una visita técnica.
+Analiza si el usuario EXPLÍCITAMENTE quiere agendar una visita técnica.
 
 FECHA HOY: ${todayStr}
 MAÑANA: ${tomorrowStr}
@@ -314,15 +314,41 @@ Responde SOLO JSON:
   "notes": "string|null"
 }
 
-REGLAS:
+REGLAS CRÍTICAS PARA shouldReserve = true:
+- El usuario DEBE DECIR EXPLÍCITAMENTE una de estas frases:
+  * "Quiero una visita"
+  * "Agendar una cita"
+  * "Reservar para [fecha]"
+  * "¿Cuándo pueden venir?"
+  * "Necesito que vengan"
+  * "Agende una visita"
+  
+- ADEMÁS, debe incluir AL MENOS 2 de estos datos:
+  * Nombre completo
+  * Teléfono
+  * Dirección/ubicación específica
+  * Fecha o franja horaria clara
+  * Tipo de servicio concreto
+
+FRASES QUE NO SON SOLICITUD DE RESERVACIÓN:
+- "Busco un servicio" → Solo clasificación
+- "¿Qué servicios ofrecen?" → Solo información
+- "Necesito ayuda con..." → Diagnóstico inicial
+- "No tengo presupuesto" → Objeción
+- "Me interesa pero..." → Interés pero no confirmado
+
+IMPORTANTE:
+- NO ASUMAS contexto
+- Si NO hay mínimo 2 datos concretos → shouldReserve = false
+- Si NO hay frase explícita de agendamiento → shouldReserve = false
+- Solo cuando confidence >= 0.8 Y tengas al menos 2 datos concretos → shouldReserve = true
+
+CONVERSIÓN DE HORARIOS:
 - "mañana" → ${tomorrowStr}
-- IMPORTANTE: La hora debe ser EXACTA en bloques de hora (09:00, 10:00, etc.)
+- "2 PM" → 14:00 (en bloques de hora exacta)
+- "tarde" → No asumas, solo extrae si es específico (ej: 14:00, 15:00)
 - La hora DEBE estar entre 9 AM (09:00) y 7 PM (19:00)
-- NO aceptar horarios como 14:30, 15:45, etc.
-- Si el usuario dice "2 PM", convertir a 14:00
-- Si dice "tarde", sugerir 14:00 o 15:00
-- Detectar CDMX por CP o alcaldía
-- Extraer nombre del contexto si no viene
+- SOLO bloques de 1 hora: 09:00, 10:00, 11:00, ... 19:00
 `;
 
     const completion = await openai.chat.completions.create({

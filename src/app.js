@@ -8,6 +8,7 @@ import adminRoutes from './routes/admin.routes.js';
 import reservationRoutes from './routes/reservation.routes.js';
 import databaseRoutes from './routes/database.routes.js';
 import leadsRoutes from './routes/leads.routes.js';
+import logsRoutes from './routes/logs.routes.js';
 
 const app = express();
 
@@ -32,6 +33,9 @@ app.use('/db', databaseRoutes);
 
 // 🔹 Rutas de leads
 app.use('/leads', leadsRoutes);
+
+// 🔹 Rutas de logs
+app.use('/logs', logsRoutes);
 
 // 🔹 Health check
 app.get('/', (req, res) => {

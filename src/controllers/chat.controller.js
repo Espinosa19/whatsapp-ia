@@ -9,11 +9,13 @@ import {
 } from '../services/conversation.service.js';
 import { saveMessageToDB } from '../services/database.service.js';
 import { saveLead } from '../services/leads.service.js';
+import { logError, logSuccess, logInfo, logConversation, logWarning } from '../services/logger.service.js';
 
 export const chatWithAI = async (req, res) => {
   const { message, history, userId } = req.body;
 
   if (!message) {
+    logWarning('Mensaje vacío recibido', 'chatWithAI');
     return res.status(400).json({ error: 'Mensaje requerido' });
   }
 
@@ -21,6 +23,9 @@ export const chatWithAI = async (req, res) => {
   const userIdentifier = userId || 'postman-user-default';
 
   try {
+    // 📝 Loguear conversación entrante
+    logConversation(userIdentifier, 'user', message, 'ENTRADA');
+
     // 💾 Guardar mensaje del usuario
     await saveMessageToHistory(userIdentifier, 'user', message);
     // 💾 Guardar también en SQLite para la interfaz web
@@ -38,53 +43,44 @@ export const chatWithAI = async (req, res) => {
     }
 
     // 🤖 Generar respuesta
+    logInfo(`Generando respuesta para ${userIdentifier}`, 'chatWithAI');
     const aiResponse = await generateAIResponse({
       userMessage: message,
       conversationHistory: conversationHistory,
     });
-
-    console.log('📤 Respuesta de IA recibida:');
-    console.log('   - Tipo:', typeof aiResponse);
-    console.log('   - Es objeto:', typeof aiResponse === 'object');
-    console.log('   - Tiene reservationRequest:', aiResponse?.reservationRequest);
-    console.log('   - Contenido:', JSON.stringify(aiResponse, null, 2).substring(0, 500));
 
     // Extraer respuesta y datos de reservación si existen
     let response = aiResponse;
     let reservationResult = null;
 
     if (typeof aiResponse === 'object' && aiResponse.reservationRequest) {
-      console.log('🔄 Procesando solicitud de reservación');
+      logInfo('Solicitud de reservación detectada', 'chatWithAI');
       response = aiResponse.reply;
       
       // 📅 Procesar solicitud de reservación
       if (aiResponse.reservationData && aiResponse.reservationData.shouldReserve) {
-        console.log('✅ shouldReserve es true, validando datos...');
+        logInfo('Validando datos de reservación', 'chatWithAI');
         
         // Obtener citas existentes del usuario para validar disponibilidad
         const existingReservations = await getUserReservations(userIdentifier);
-        console.log(`📊 Citas existentes del usuario: ${existingReservations.length}`);
         
         const validation = validateAndFormatReservationData(
           aiResponse.reservationData,
           existingReservations
         );
-        console.log('📝 Resultado de validación:', validation);
         
         if (validation.valid) {
           // ✅ VALIDACIÓN PASÓ - Crear reservación
-          console.log('✅ Validación exitosa, creando reservación...');
+          logInfo('Datos validados, creando reservación', 'chatWithAI');
           reservationResult = await createReservation({
             userId: userIdentifier,
             ...validation.formatted,
           });
-          console.log('📅 Resultado de creación:', reservationResult);
 
           if (reservationResult.success) {
-            console.log('🎉 ¡Reservación creada exitosamente!');
+            logSuccess(`Reservación creada para ${validation.formatted.clientName}`, 'chatWithAI');
             
             // 🔥 GUARDAR LEAD CUANDO LA RESERVACIÓN ES EXITOSA
-            console.log('💾 Guardando lead...');
             try {
               saveLead({
                 userId: userIdentifier,
@@ -94,17 +90,16 @@ export const chatWithAI = async (req, res) => {
                 serviceType: validation.formatted.serviceType,
                 address: validation.formatted.address,
                 city: validation.formatted.city,
-                status: 'convertido', // Lead convertido a reservación
+                status: 'convertido',
                 notes: validation.formatted.notes,
                 preferredDate: validation.formatted.dateTime.split('T')[0],
                 preferredTime: validation.formatted.dateTime.split('T')[1].substring(0, 5),
                 eventId: reservationResult.eventId,
                 calendarLink: reservationResult.eventLink,
               });
-              console.log('✅ Lead guardado correctamente');
+              logSuccess(`Lead guardado: ${validation.formatted.clientName}`, 'chatWithAI');
             } catch (leadError) {
-              console.error('⚠️ Error guardando lead:', leadError.message);
-              // No fallar la reservación si hay error guardando lead
+              logError(leadError, 'saveLead');
             }
             
             response += `\n\n✅ *RESERVACIÓN CONFIRMADA*\n`;
@@ -113,14 +108,13 @@ export const chatWithAI = async (req, res) => {
             response += `📍 Ubicación: ${reservationResult.reservation.address}\n`;
             response += `🔗 Link: ${reservationResult.eventLink}`;
           } else {
-            console.error('❌ Error creando reservación:', reservationResult.error);
+            logError(new Error(reservationResult.error), 'createReservation');
             response += `\n\n❌ *No se pudo crear la reservación*\n`;
             response += `Error: ${reservationResult.error}`;
           }
         } else {
-          // ❌ VALIDACIÓN FALLÓ - No usar la respuesta de IA, solo mostrar el error
-          console.warn('⚠️ Validación falló:', validation.error);
-          // Reemplazar completamente la respuesta anterior con solo el error
+          // ❌ VALIDACIÓN FALLÓ
+          logWarning(`Validación fallida: ${validation.error}`, 'chatWithAI');
           response = validation.error;
           
           if (validation.missingData && validation.missingData.length > 0) {
@@ -143,6 +137,9 @@ export const chatWithAI = async (req, res) => {
     // 💾 Guardar también en SQLite para la interfaz web
     saveMessageToDB(userIdentifier, 'assistant', response);
 
+    // 📝 Loguear conversación saliente
+    logConversation(userIdentifier, 'assistant', response, 'SALIDA');
+
     res.json({
       reply: response,
       userId: userIdentifier,
@@ -154,10 +151,26 @@ export const chatWithAI = async (req, res) => {
       } : null,
     });
   } catch (error) {
-    console.error('❌ Error en Chat Controller:', error);
+    // 🔴 MANEJO DE ERRORES CON LOGGING
+    logError(error, 'chatWithAI');
+
+    const userIdentifier = req.body.userId || 'postman-user-default';
+    const errorMessage = `❌ Hubo un problema procesando tu mensaje: "${error.message}"\n\n¿Podrías repetir lo que dijiste? Eso nos ayudará a resolver el problema.`;
+
+    try {
+      // Guardar el intento fallido en el historial
+      await saveMessageToHistory(userIdentifier, 'assistant', errorMessage);
+      saveMessageToDB(userIdentifier, 'assistant', errorMessage);
+    } catch (historyError) {
+      logError(historyError, 'saveMessageToHistory');
+    }
+
     res.status(500).json({
+      reply: errorMessage,
       error: 'Error al procesar el mensaje',
       details: error.message,
+      userId: userIdentifier,
+      shouldRetry: true,
     });
   }
 };
