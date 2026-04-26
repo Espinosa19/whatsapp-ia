@@ -29,6 +29,11 @@ export const chatWithAI = async (req, res) => {
     // 💾 Guardar mensaje del usuario
     await saveMessageToHistory(userIdentifier, 'user', message);
     // 💾 Guardar también en SQLite para la interfaz web
+    console.log('[DEBUG] Guardando mensaje en SQLite:', {
+      userIdentifier,
+      role: 'user',
+      message
+    });
     saveMessageToDB(userIdentifier, 'user', message);
 
     // 📚 Obtener historial (si no se envía, recuperar del archivo)
@@ -44,16 +49,21 @@ export const chatWithAI = async (req, res) => {
 
     // 🤖 Generar respuesta
     logInfo(`Generando respuesta para ${userIdentifier}`, 'chatWithAI');
-    const aiResponse = await generateAIResponse({
+   const aiResponse = await generateAIResponse({
       userMessage: message,
       conversationHistory: conversationHistory,
+      userId: userIdentifier // 🔥 FIX
     });
 
     // Extraer respuesta y datos de reservación si existen
     let response = aiResponse;
     let reservationResult = null;
 
-    if (typeof aiResponse === 'object' && aiResponse.reservationRequest) {
+    if (
+      typeof aiResponse === 'object' &&
+      aiResponse.reservationRequest === true &&
+      aiResponse.reservationData
+    ) {
       logInfo('Solicitud de reservación detectada', 'chatWithAI');
       response = aiResponse.reply;
       
@@ -103,7 +113,6 @@ export const chatWithAI = async (req, res) => {
             response += `� Fecha: ${new Date(reservationResult.reservation.dateTime).toLocaleDateString('es-MX')}\n`;
             response += `⏰ Hora: ${new Date(reservationResult.reservation.dateTime).toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' })}\n`;
             response += `📍 Ubicación: ${reservationResult.reservation.address}\n`;
-            response += `🔗 Link: ${reservationResult.eventLink}`;
           } else {
             logError(new Error(reservationResult.error), 'createReservation');
             response += `\n\n❌ *No se pudo crear la reservación*\n`;
@@ -143,13 +152,35 @@ export const chatWithAI = async (req, res) => {
     // 💾 Guardar respuesta de la IA
     await saveMessageToHistory(userIdentifier, 'assistant', response);
     // 💾 Guardar también en SQLite para la interfaz web
-    saveMessageToDB(userIdentifier, 'assistant', response);
+    let responseToSave = response;
+    if (typeof response === 'object' && response !== null && typeof response.reply === 'string') {
+      responseToSave = response.reply;
+    }
+    console.log('[DEBUG] Guardando respuesta en SQLite:', {
+      userIdentifier,
+      role: 'assistant',
+      response: responseToSave
+    });
+    saveMessageToDB(userIdentifier, 'assistant', responseToSave);
 
     // 📝 Loguear conversación saliente
-    logConversation(userIdentifier, 'assistant', response, 'SALIDA');
+    let responseForLog = response;
+    if (typeof responseForLog !== 'string') {
+      if (responseForLog && typeof responseForLog.reply === 'string') {
+        responseForLog = responseForLog.reply;
+      } else {
+        responseForLog = String(responseForLog);
+      }
+    }
+    logConversation(userIdentifier, 'assistant', responseForLog, 'SALIDA');
 
+    // Evitar doble anidación de 'reply' en la respuesta JSON
+    let replyToSend = response;
+    if (typeof replyToSend === 'object' && replyToSend !== null && typeof replyToSend.reply === 'string') {
+      replyToSend = replyToSend.reply;
+    }
     res.json({
-      reply: response,
+      reply: replyToSend,
       userId: userIdentifier,
       historySize: conversationHistory.length,
       reservation: reservationResult ? {
@@ -168,7 +199,17 @@ export const chatWithAI = async (req, res) => {
     try {
       // Guardar el intento fallido en el historial
       await saveMessageToHistory(userIdentifier, 'assistant', errorMessage);
-      saveMessageToDB(userIdentifier, 'assistant', errorMessage);
+      console.log('[DEBUG] Guardando error en SQLite:', {
+        userIdentifier,
+        role: 'assistant',
+        errorMessage
+      });
+      // Evitar bucle infinito si el error es de parámetros insuficientes
+      if (!errorMessage.includes('Too few parameter values were provided')) {
+        saveMessageToDB(userIdentifier, 'assistant', errorMessage);
+      } else {
+        console.warn('[WARN] No se guarda en SQLite para evitar bucle de error:', errorMessage);
+      }
     } catch (historyError) {
       logError(historyError, 'saveMessageToHistory');
     }

@@ -9,204 +9,170 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
     const systemPrompt = await fs.readFile(promptPath, 'utf-8');
 
     const analysis = await analyzeUserMessage(userMessage);
-    console.log('📊 Análisis:', analysis);
-
     const redis = await getRedisClient();
 
-    const clientNameKey = userId ? `clientName_temp:${userId}` : null;
-    const clientEmailKey = userId ? `clientEmail_temp:${userId}` : null;
-    const addressKey = userId ? `address_temp:${userId}` : null;
+    // =========================
+    // 🔑 REDIS KEYS
+    // =========================
+    const clientNameKey = userId ? `clientName:${userId}` : null;
+    const clientEmailKey = userId ? `clientEmail:${userId}` : null;
+    const addressKey = userId ? `address:${userId}` : null;
+    const pendingReservationKey = userId ? `pendingReservation:${userId}` : null;
 
-    // 🔍 DETECCIONES
-    let detectedName = null;
-    let detectedEmail = null;
-    let detectedAddress = null;
-    let isBusiness = false;
-
-    // Nombre
+    // =========================
+    // 🧠 EXTRACCIÓN SIMPLE
+    // =========================
     const nameMatch = userMessage.match(/(mi nombre es|soy|me llamo)\s+([a-záéíóúüñ\s]+)/i);
-    if (nameMatch) detectedName = nameMatch[2].trim();
-
-    // Empresa
-    if (/empresa|negocio|represento a/i.test(userMessage)) {
-      isBusiness = true;
-    }
-
-    // Email
     const emailMatch = userMessage.match(/([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)/);
-    if (emailMatch) detectedEmail = emailMatch[1];
 
-    // Dirección
-    const addressMatch = userMessage.match(/((calle|av\.?|avenida|colonia|delegación|numero|número|cp|c\.p\.|manzana|lote|edificio|departamento|#)\s*[^.,\n]*)/i);
-    if (addressMatch) detectedAddress = addressMatch[0].trim();
+    // 🔥 MEJOR DETECCIÓN DE DIRECCIÓN
+    const addressMatch = userMessage.match(
+      /(calle|avenida|av\.?|colonia|col\.?|cp|c\.p\.?|número|numero|mz|manzana|lote|int|interior).+/i
+    );
 
+    const detectedName = nameMatch?.[2]?.trim() || null;
+    const detectedEmail = emailMatch?.[1] || null;
+    const detectedAddress = addressMatch?.[0]?.trim() || null;
+
+    // =========================
     // 💾 GUARDAR EN REDIS
+    // =========================
     if (clientNameKey && detectedName) {
-      const exists = await redis.get(clientNameKey);
-      if (!exists) await redis.setEx(clientNameKey, 3600, detectedName);
+      await redis.setEx(clientNameKey, 3600, detectedName);
     }
 
     if (clientEmailKey && detectedEmail) {
-      const exists = await redis.get(clientEmailKey);
-      if (!exists) await redis.setEx(clientEmailKey, 3600, detectedEmail);
+      await redis.setEx(clientEmailKey, 3600, detectedEmail);
     }
 
     if (addressKey && detectedAddress) {
-      const exists = await redis.get(addressKey);
-      if (!exists) await redis.setEx(addressKey, 3600, detectedAddress);
+      await redis.setEx(addressKey, 3600, detectedAddress);
     }
 
-    // 🔥 RECUPERAR DATOS
+    // =========================
+    // 🔄 RECUPERAR
+    // =========================
     const clientName = clientNameKey ? await redis.get(clientNameKey) : null;
     const clientEmail = clientEmailKey ? await redis.get(clientEmailKey) : null;
     const address = addressKey ? await redis.get(addressKey) : null;
 
-    // 🧠 RESERVACIÓN
+    const wantsAppointment =
+      /visita|cita|agendar|agenda|instalación|revisión|que vayan/i.test(userMessage);
+
     let reservationData = null;
 
-    if (analysis.tipo_servicio === 'servicio') {
+    // =========================
+    // 🧠 FLUJO DE RESERVACIÓN
+    // =========================
+    if (wantsAppointment) {
       reservationData = await detectAndExtractReservationData(userMessage, conversationHistory);
 
-      if (reservationData) {
+      reservationData = {
+        ...reservationData,
+        clientName: clientName || reservationData.clientName,
+        clientEmail: clientEmail || reservationData.clientEmail,
+        address: address || reservationData.address,
+      };
 
-        // 🛡️ NORMALIZAR ESTRUCTURA (CLAVE)
-        reservationData = {
-          missingData: [],
-          shouldReserve: false,
-          ...reservationData
+      const missing = [];
+
+      if (!reservationData.clientName) missing.push("Nombre completo");
+      if (!reservationData.address) missing.push("Dirección completa");
+      if (!reservationData.preferredDate) missing.push("Fecha");
+      if (!reservationData.preferredTime) missing.push("Hora");
+
+      // 🔥 SI YA TIENE TODO → SOLO AVISA (NO AGENDA)
+      if (missing.length === 0 && reservationData.shouldReserve) {
+        return {
+          reply: `Perfecto 👍 ya tengo todos los datos para agendar tu visita.`,
+          reservationRequest: true,
+          reservationData
         };
-
-        if (!Array.isArray(reservationData.missingData)) {
-          reservationData.missingData = [];
-        }
-
-        // ✅ ASIGNAR DATOS GLOBALES
-        if (clientName) reservationData.clientName = clientName;
-        if (clientEmail) reservationData.clientEmail = clientEmail;
-        if (address) reservationData.address = address;
-
-        // 🚫 NUNCA PEDIR NOMBRE
-        reservationData.missingData = reservationData.missingData.filter(
-          x => x !== 'Nombre completo'
-        );
-
-        // 🚨 VALIDACIÓN DE DATOS FALTANTES (dirección, fecha, hora, etc)
-        const hasAddress = reservationData.address && reservationData.address.trim().length > 10;
-        const hasDate = reservationData.preferredDate && reservationData.preferredDate.length === 10;
-        const hasTime = reservationData.preferredTime && reservationData.preferredTime.length >= 4;
-
-        // Asegurar que los campos críticos estén en missingData si faltan
-        if (!hasAddress && !reservationData.missingData.includes('Dirección específica')) {
-          reservationData.missingData.push('Dirección específica');
-        }
-        if (!hasDate && !reservationData.missingData.includes('📅 Fecha preferida (ej: 2026-04-22)')) {
-          reservationData.missingData.push('📅 Fecha preferida (ej: 2026-04-22)');
-        }
-        if (!hasTime && !reservationData.missingData.includes('⏰ Hora preferida (ej: 14:00)')) {
-          reservationData.missingData.push('⏰ Hora preferida (ej: 14:00)');
-        }
-
-        // Autocompletar correo si ya lo tenemos
-        if (clientEmail && reservationData.missingData.includes('Correo electrónico')) {
-          reservationData.missingData = reservationData.missingData.filter(x => x !== 'Correo electrónico');
-        }
-
-        // Si ya tenemos dirección, eliminar cualquier variante de dirección de missingData
-        if (hasAddress) {
-          reservationData.missingData = reservationData.missingData.filter(
-            x => !x.toLowerCase().includes('dirección')
-          );
-        }
-        // Si ya tenemos fecha, eliminar cualquier variante de fecha de missingData
-        if (hasDate) {
-          reservationData.missingData = reservationData.missingData.filter(
-            x => !x.toLowerCase().includes('fecha')
-          );
-        }
-        // Si ya tenemos hora, eliminar cualquier variante de hora de missingData
-        if (hasTime) {
-          reservationData.missingData = reservationData.missingData.filter(
-            x => !x.toLowerCase().includes('hora')
-          );
-        }
-
-        // 🔒 VALIDACIÓN FINAL (DOBLE SEGURO)
-        if (reservationData.missingData.length === 0 && hasAddress && hasDate && hasTime) {
-          reservationData.shouldReserve = true;
-        } else {
-          reservationData.shouldReserve = false;
-        }
-
-        // 📩 PEDIR DATOS FALTANTES
-        if (!reservationData.shouldReserve && reservationData.missingData.length > 0) {
-          const missingDataText = reservationData.missingData
-            .map((item, idx) => `${idx + 1}. ${item}`)
-            .join('\n');
-
-          let extra = '';
-          if (isBusiness && reservationData.missingData.includes('Correo electrónico')) {
-            extra = '\nComo representas a una empresa, ¿podrías proporcionarme un correo electrónico de contacto?';
-          }
-
-          return `
-Para poder agendar tu visita técnica, necesito:
-
-${missingDataText}${extra}
-
-¿Me apoyas con estos datos? 😊
-(La dirección debe incluir calle, número, colonia y delegación)
-`;
-        }
       }
+
+      // ❌ FALTAN DATOS
+      await redis.setEx(pendingReservationKey, 900, JSON.stringify(reservationData));
+
+      return {
+        reply: `Para agendar tu visita necesito:\n\n${missing.map((m, i) => `${i + 1}. ${m}`).join('\n')}\n\n¿Me apoyas con esos datos? 😊`,
+        reservationRequest: false,
+        reservationData: {
+          missingData: missing
+        }
+      };
     }
 
-    // 🤖 RESPUESTA IA
-    const response = await generateContextualResponse({
+    // =========================
+    // 🔄 CONTINUAR RESERVACIÓN
+    // =========================
+    const pendingStr = await redis.get(pendingReservationKey);
+
+    if (pendingStr) {
+      let pending = JSON.parse(pendingStr);
+
+      const extracted = await detectAndExtractReservationData(userMessage, conversationHistory);
+
+      reservationData = {
+        ...pending,
+        ...extracted,
+        clientName: detectedName || clientName || pending.clientName,
+        address: detectedAddress || address || pending.address,
+        clientEmail: detectedEmail || clientEmail || pending.clientEmail,
+      };
+
+      const missing = [];
+
+      if (!reservationData.clientName) missing.push("Nombre completo");
+      if (!reservationData.address) missing.push("Dirección completa");
+      if (!reservationData.preferredDate) missing.push("Fecha");
+      if (!reservationData.preferredTime) missing.push("Hora");
+
+      if (missing.length === 0 && reservationData.shouldReserve) {
+        if (pendingReservationKey) {
+          await redis.del(pendingReservationKey);
+        }
+
+        return {
+          reply: `Perfecto 👍 ya tengo todos los datos para agendar tu visita.`,
+          reservationRequest: true,
+          reservationData
+        };
+      }
+
+      if (pendingReservationKey && reservationData && typeof reservationData === 'object') {
+        await redis.setEx(
+          pendingReservationKey,
+          900,
+          JSON.stringify(reservationData)
+        );
+      }
+
+
+      return {
+        reply: `Aún me faltan estos datos:\n\n${missing.map((m, i) => `${i + 1}. ${m}`).join('\n')}`,
+        reservationRequest: false,
+        reservationData: {
+          missingData: missing
+        }
+      };
+    }
+
+    // =========================
+    // 🤖 RESPUESTA NORMAL
+    // =========================
+    return await generateContextualResponse({
       userMessage,
       conversationHistory,
       systemPrompt,
       analysis
     });
 
-
-    // ✅ RESPUESTA FINAL: Intentar agendar en Google Calendar
-    if (reservationData && reservationData.shouldReserve) {
-      try {
-        // Llamar a la función que agenda la cita en Google Calendar
-        const calendarResult = await createGoogleCalendarEvent(reservationData);
-        if (calendarResult && calendarResult.success) {
-          // Confirmar al usuario con detalles de la cita
-          return {
-            reply: `✅ ¡Tu cita ha sido agendada exitosamente para el ${reservationData.preferredDate} a las ${reservationData.preferredTime}!\n\n${calendarResult.message || ''}`,
-            reservationRequest: true,
-            reservationData,
-            calendarEvent: calendarResult.event || null
-          };
-        } else {
-          // Error al agendar
-          return {
-            reply: `❌ Ocurrió un error al agendar tu cita en el calendario. ${calendarResult && calendarResult.message ? calendarResult.message : 'Por favor intenta de nuevo más tarde.'}`,
-            reservationRequest: false,
-            reservationData
-          };
-        }
-      } catch (calendarError) {
-        console.error('❌ Error al agendar en Google Calendar:', calendarError);
-        return {
-          reply: '❌ Ocurrió un error inesperado al intentar agendar tu cita en el calendario. Por favor intenta de nuevo más tarde.',
-          reservationRequest: false,
-          reservationData
-        };
-      }
-    }
-
-    return response;
-
   } catch (error) {
     console.error('❌ Error IA:', error);
-    return 'Lo siento, ocurrió un error. Por favor intenta de nuevo.';
+    return { reply: 'Ocurrió un error. Intenta nuevamente.' };
   }
 }
+
 
 
 /**

@@ -5,16 +5,16 @@ import { getDatabase } from '../config/database.config.js';
  */
 export function saveMessageToDB(userId, role, content) {
   try {
+    if (!userId || !role || !content) {
+      throw new RangeError(`Too few parameter values were provided: userId='${userId}', role='${role}', content='${content}'`);
+    }
     const db = getDatabase();
-    
     const stmt = db.prepare(`
       INSERT INTO messages (user_id, role, content)
       VALUES (?, ?, ?)
     `);
-
     stmt.run(userId, role, content);
     updateUserStats(userId);
-
     console.log(`💾 Mensaje guardado en SQLite para ${userId}`);
     return { success: true };
   } catch (error) {
