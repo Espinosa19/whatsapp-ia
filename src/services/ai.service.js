@@ -1,49 +1,166 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { getOpenAIInstance } from '../config/openai.config.js';
-
-export async function generateAIResponse({ userMessage, conversationHistory = [] }) {
+import { getRedisClient } from '../config/redis.config.js';
+import { createGoogleCalendarEvent } from '../services/google-calendar.service.js';
+export async function generateAIResponse({ userMessage, conversationHistory = [], userId }) {
   try {
-
-    // 📥 1. Leer prompt base (tu negocio)
     const promptPath = path.resolve('src/prompts/assistant.txt');
     const systemPrompt = await fs.readFile(promptPath, 'utf-8');
 
-    // 🧠 2. Analizar mensaje
     const analysis = await analyzeUserMessage(userMessage);
     console.log('📊 Análisis:', analysis);
 
-    // 📅 3. Detectar si es solicitud de reservación
-    let reservationData = null;
-    if (analysis.tipo_servicio === 'servicio') {
-      console.log('🔍 Tipo de servicio detectado, extrayendo datos de reservación...');
-      reservationData = await detectAndExtractReservationData(userMessage, conversationHistory);
-      console.log('📋 Datos de reservación extraídos:', JSON.stringify(reservationData, null, 2));
-      console.log('📋 shouldReserve =', reservationData?.shouldReserve);
-      
-      // Si falta información pero es una solicitud clara
-      if (reservationData && !reservationData.shouldReserve && reservationData.missingData?.length > 0) {
-        console.log('⚠️ Reservación incompleta, pidiendo datos faltantes:', reservationData.missingData);
-        
-        // Generar respuesta pidiendo datos específicos
-        const missingDataText = reservationData.missingData
-          .map((item, idx) => `${idx + 1}. ${item}`)
-          .join('\n');
-          
-        const incompleteResponse = `
-Para poder agendar tu visita técnica, necesito que me proporciones la siguiente información:
+    const redis = await getRedisClient();
 
-${missingDataText}
+    const clientNameKey = userId ? `clientName_temp:${userId}` : null;
+    const clientEmailKey = userId ? `clientEmail_temp:${userId}` : null;
+    const addressKey = userId ? `address_temp:${userId}` : null;
 
-¿Puedes decirme estos datos? 😊
-`;
-        return incompleteResponse;
-      }
-    } else {
-      console.log('ℹ️ Tipo de servicio NO es "servicio", es:', analysis.tipo_servicio);
+    // 🔍 DETECCIONES
+    let detectedName = null;
+    let detectedEmail = null;
+    let detectedAddress = null;
+    let isBusiness = false;
+
+    // Nombre
+    const nameMatch = userMessage.match(/(mi nombre es|soy|me llamo)\s+([a-záéíóúüñ\s]+)/i);
+    if (nameMatch) detectedName = nameMatch[2].trim();
+
+    // Empresa
+    if (/empresa|negocio|represento a/i.test(userMessage)) {
+      isBusiness = true;
     }
 
-    // 🤖 4. Generar respuesta inteligente
+    // Email
+    const emailMatch = userMessage.match(/([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)/);
+    if (emailMatch) detectedEmail = emailMatch[1];
+
+    // Dirección
+    const addressMatch = userMessage.match(/((calle|av\.?|avenida|colonia|delegación|numero|número|cp|c\.p\.|manzana|lote|edificio|departamento|#)\s*[^.,\n]*)/i);
+    if (addressMatch) detectedAddress = addressMatch[0].trim();
+
+    // 💾 GUARDAR EN REDIS
+    if (clientNameKey && detectedName) {
+      const exists = await redis.get(clientNameKey);
+      if (!exists) await redis.setEx(clientNameKey, 3600, detectedName);
+    }
+
+    if (clientEmailKey && detectedEmail) {
+      const exists = await redis.get(clientEmailKey);
+      if (!exists) await redis.setEx(clientEmailKey, 3600, detectedEmail);
+    }
+
+    if (addressKey && detectedAddress) {
+      const exists = await redis.get(addressKey);
+      if (!exists) await redis.setEx(addressKey, 3600, detectedAddress);
+    }
+
+    // 🔥 RECUPERAR DATOS
+    const clientName = clientNameKey ? await redis.get(clientNameKey) : null;
+    const clientEmail = clientEmailKey ? await redis.get(clientEmailKey) : null;
+    const address = addressKey ? await redis.get(addressKey) : null;
+
+    // 🧠 RESERVACIÓN
+    let reservationData = null;
+
+    if (analysis.tipo_servicio === 'servicio') {
+      reservationData = await detectAndExtractReservationData(userMessage, conversationHistory);
+
+      if (reservationData) {
+
+        // 🛡️ NORMALIZAR ESTRUCTURA (CLAVE)
+        reservationData = {
+          missingData: [],
+          shouldReserve: false,
+          ...reservationData
+        };
+
+        if (!Array.isArray(reservationData.missingData)) {
+          reservationData.missingData = [];
+        }
+
+        // ✅ ASIGNAR DATOS GLOBALES
+        if (clientName) reservationData.clientName = clientName;
+        if (clientEmail) reservationData.clientEmail = clientEmail;
+        if (address) reservationData.address = address;
+
+        // 🚫 NUNCA PEDIR NOMBRE
+        reservationData.missingData = reservationData.missingData.filter(
+          x => x !== 'Nombre completo'
+        );
+
+        // 🚨 VALIDACIÓN DE DATOS FALTANTES (dirección, fecha, hora, etc)
+        const hasAddress = reservationData.address && reservationData.address.trim().length > 10;
+        const hasDate = reservationData.preferredDate && reservationData.preferredDate.length === 10;
+        const hasTime = reservationData.preferredTime && reservationData.preferredTime.length >= 4;
+
+        // Asegurar que los campos críticos estén en missingData si faltan
+        if (!hasAddress && !reservationData.missingData.includes('Dirección específica')) {
+          reservationData.missingData.push('Dirección específica');
+        }
+        if (!hasDate && !reservationData.missingData.includes('📅 Fecha preferida (ej: 2026-04-22)')) {
+          reservationData.missingData.push('📅 Fecha preferida (ej: 2026-04-22)');
+        }
+        if (!hasTime && !reservationData.missingData.includes('⏰ Hora preferida (ej: 14:00)')) {
+          reservationData.missingData.push('⏰ Hora preferida (ej: 14:00)');
+        }
+
+        // Autocompletar correo si ya lo tenemos
+        if (clientEmail && reservationData.missingData.includes('Correo electrónico')) {
+          reservationData.missingData = reservationData.missingData.filter(x => x !== 'Correo electrónico');
+        }
+
+        // Si ya tenemos dirección, eliminar cualquier variante de dirección de missingData
+        if (hasAddress) {
+          reservationData.missingData = reservationData.missingData.filter(
+            x => !x.toLowerCase().includes('dirección')
+          );
+        }
+        // Si ya tenemos fecha, eliminar cualquier variante de fecha de missingData
+        if (hasDate) {
+          reservationData.missingData = reservationData.missingData.filter(
+            x => !x.toLowerCase().includes('fecha')
+          );
+        }
+        // Si ya tenemos hora, eliminar cualquier variante de hora de missingData
+        if (hasTime) {
+          reservationData.missingData = reservationData.missingData.filter(
+            x => !x.toLowerCase().includes('hora')
+          );
+        }
+
+        // 🔒 VALIDACIÓN FINAL (DOBLE SEGURO)
+        if (reservationData.missingData.length === 0 && hasAddress && hasDate && hasTime) {
+          reservationData.shouldReserve = true;
+        } else {
+          reservationData.shouldReserve = false;
+        }
+
+        // 📩 PEDIR DATOS FALTANTES
+        if (!reservationData.shouldReserve && reservationData.missingData.length > 0) {
+          const missingDataText = reservationData.missingData
+            .map((item, idx) => `${idx + 1}. ${item}`)
+            .join('\n');
+
+          let extra = '';
+          if (isBusiness && reservationData.missingData.includes('Correo electrónico')) {
+            extra = '\nComo representas a una empresa, ¿podrías proporcionarme un correo electrónico de contacto?';
+          }
+
+          return `
+Para poder agendar tu visita técnica, necesito:
+
+${missingDataText}${extra}
+
+¿Me apoyas con estos datos? 😊
+(La dirección debe incluir calle, número, colonia y delegación)
+`;
+        }
+      }
+    }
+
+    // 🤖 RESPUESTA IA
     const response = await generateContextualResponse({
       userMessage,
       conversationHistory,
@@ -51,16 +168,36 @@ ${missingDataText}
       analysis
     });
 
-    // Retornar respuesta con información de reservación si aplica
+
+    // ✅ RESPUESTA FINAL: Intentar agendar en Google Calendar
     if (reservationData && reservationData.shouldReserve) {
-      console.log('✅ Solicitud de reservación detectada y confirmada');
-      return {
-        reply: response,
-        reservationRequest: true,
-        reservationData: reservationData,
-      };
-    } else if (reservationData) {
-      console.log('⚠️ reservationData existe pero shouldReserve es:', reservationData.shouldReserve);
+      try {
+        // Llamar a la función que agenda la cita en Google Calendar
+        const calendarResult = await createGoogleCalendarEvent(reservationData);
+        if (calendarResult && calendarResult.success) {
+          // Confirmar al usuario con detalles de la cita
+          return {
+            reply: `✅ ¡Tu cita ha sido agendada exitosamente para el ${reservationData.preferredDate} a las ${reservationData.preferredTime}!\n\n${calendarResult.message || ''}`,
+            reservationRequest: true,
+            reservationData,
+            calendarEvent: calendarResult.event || null
+          };
+        } else {
+          // Error al agendar
+          return {
+            reply: `❌ Ocurrió un error al agendar tu cita en el calendario. ${calendarResult && calendarResult.message ? calendarResult.message : 'Por favor intenta de nuevo más tarde.'}`,
+            reservationRequest: false,
+            reservationData
+          };
+        }
+      } catch (calendarError) {
+        console.error('❌ Error al agendar en Google Calendar:', calendarError);
+        return {
+          reply: '❌ Ocurrió un error inesperado al intentar agendar tu cita en el calendario. Por favor intenta de nuevo más tarde.',
+          reservationRequest: false,
+          reservationData
+        };
+      }
     }
 
     return response;
@@ -70,6 +207,7 @@ ${missingDataText}
     return 'Lo siento, ocurrió un error. Por favor intenta de nuevo.';
   }
 }
+
 
 /**
  * Analiza el mensaje de un usuario y devuelve:
@@ -246,11 +384,19 @@ Mensaje del cliente:
 Responde como asesor de ventas experto.
 `;
 
+
+    // Filtrar y mapear conversationHistory para asegurar que content sea string
+    const safeHistory = Array.isArray(conversationHistory)
+      ? conversationHistory
+          .filter(msg => msg && typeof msg.content === 'string')
+          .map(msg => ({ ...msg, content: String(msg.content) }))
+      : [];
+
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
         { role: 'system', content: finalPrompt },
-        ...conversationHistory,
+        ...safeHistory,
         { role: 'user', content: userMessage }
       ],
       temperature: 0.6,
@@ -515,13 +661,50 @@ export function validateAndFormatReservationData(data, existingAppointments = []
       
       console.log(`✅ Fecha/hora parseada correctamente: ${dateTime.toISOString()}`);
       
-      // Validar que la fecha no esté en el pasado
+      // Validar que la fecha no esté en el pasado (normalizando a minutos exactos)
       const now = new Date();
-      if (dateTime < now) {
-        console.warn(`⚠️ Fecha en el pasado: ${dateTime} < ${now}`);
+      const nowNormalized = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours(), now.getMinutes(), 0, 0);
+      if (dateTime.getTime() <= nowNormalized.getTime()) {
+        console.warn(`⚠️ Fecha en el pasado: ${dateTime} <= ${nowNormalized}`);
+        // Sugerir próxima hora disponible de hoy o de mañana
+        let suggestedDateTime = null;
+        let suggestedStr = '';
+        const currentYear = now.getFullYear();
+        const currentMonth = now.getMonth();
+        const currentDay = now.getDate();
+        let nextHour = now.getHours() + 1;
+        // Si ya pasó el horario de atención hoy, sugerir primer bloque de mañana
+        if (nextHour > 19) {
+          // Mañana a las 9:00
+          const tomorrow = new Date(currentYear, currentMonth, currentDay + 1, 9, 0, 0, 0);
+          suggestedDateTime = tomorrow;
+          suggestedStr = `mañana a las 09:00`;
+        } else if (nextHour < 9) {
+          // Hoy a las 9:00
+          const todayMorning = new Date(currentYear, currentMonth, currentDay, 9, 0, 0, 0);
+          suggestedDateTime = todayMorning;
+          suggestedStr = `hoy a las 09:00`;
+        } else {
+          // Hoy a la siguiente hora disponible
+          const todayNext = new Date(currentYear, currentMonth, currentDay, nextHour, 0, 0, 0);
+          // Si la hora sugerida ya pasó por minutos, sumar otra hora
+          if (todayNext <= nowNormalized) {
+            todayNext.setHours(todayNext.getHours() + 1);
+          }
+          // Si ya no hay bloques hoy, sugerir mañana a las 9:00
+          if (todayNext.getHours() > 19) {
+            const tomorrow = new Date(currentYear, currentMonth, currentDay + 1, 9, 0, 0, 0);
+            suggestedDateTime = tomorrow;
+            suggestedStr = `mañana a las 09:00`;
+          } else {
+            suggestedDateTime = todayNext;
+            suggestedStr = `hoy a las ${String(todayNext.getHours()).padStart(2, '0')}:00`;
+          }
+        }
         return {
           valid: false,
-          error: '❌ La fecha y hora que especificaste ya pasaron. Por favor elige una fecha futura.',
+          error: `❌ La fecha y hora que especificaste ya pasaron. Te propongo: ${suggestedStr}. ¿Te funciona ese horario?`,
+          suggestedDateTime: suggestedDateTime.toISOString(),
         };
       }
       

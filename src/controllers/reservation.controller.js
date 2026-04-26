@@ -141,14 +141,38 @@ export const getAvailableSlotsController = async (req, res) => {
   }
 
   try {
-    const slots = await getAvailableSlots(new Date(date), parseInt(duration) || 60);
+    const { availableSlots, nextAvailable } = await getAvailableSlots(new Date(date), parseInt(duration) || 60);
 
-    res.json({
-      date,
-      duration: parseInt(duration) || 60,
-      availableSlots: slots,
-      totalSlots: slots.length,
-    });
+    if (availableSlots && availableSlots.length > 0) {
+      // Hay horarios disponibles para la fecha solicitada
+      return res.json({
+        date,
+        duration: parseInt(duration) || 60,
+        availableSlots,
+        totalSlots: availableSlots.length,
+        message: `Horarios disponibles para el ${date}:\n${availableSlots.map(slot => new Date(slot.start).toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' })).join(', ')}`
+      });
+    } else if (nextAvailable && nextAvailable.slots && nextAvailable.slots.length > 0) {
+      // No hay horarios hoy, sugerir el siguiente día disponible
+      return res.json({
+        date,
+        duration: parseInt(duration) || 60,
+        availableSlots: [],
+        totalSlots: 0,
+        nextAvailableDate: nextAvailable.date,
+        nextAvailableSlots: nextAvailable.slots,
+        message: `No hay horarios disponibles para hoy. El siguiente día con disponibilidad es el ${nextAvailable.date}:\n${nextAvailable.slots.map(slot => new Date(slot.start).toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' })).join(', ')}`
+      });
+    } else {
+      // No hay horarios en los próximos días
+      return res.json({
+        date,
+        duration: parseInt(duration) || 60,
+        availableSlots: [],
+        totalSlots: 0,
+        message: 'No hay horarios disponibles en los próximos días. Por favor, intenta más tarde.'
+      });
+    }
   } catch (error) {
     console.error('❌ Error obteniendo slots:', error);
     res.status(500).json({

@@ -60,15 +60,13 @@ export const chatWithAI = async (req, res) => {
       // 📅 Procesar solicitud de reservación
       if (aiResponse.reservationData && aiResponse.reservationData.shouldReserve) {
         logInfo('Validando datos de reservación', 'chatWithAI');
-        
         // Obtener citas existentes del usuario para validar disponibilidad
         const existingReservations = await getUserReservations(userIdentifier);
-        
         const validation = validateAndFormatReservationData(
           aiResponse.reservationData,
           existingReservations
         );
-        
+        console.log('Validación de reservación:', validation);
         if (validation.valid) {
           // ✅ VALIDACIÓN PASÓ - Crear reservación
           logInfo('Datos validados, creando reservación', 'chatWithAI');
@@ -79,7 +77,6 @@ export const chatWithAI = async (req, res) => {
 
           if (reservationResult.success) {
             logSuccess(`Reservación creada para ${validation.formatted.clientName}`, 'chatWithAI');
-            
             // 🔥 GUARDAR LEAD CUANDO LA RESERVACIÓN ES EXITOSA
             try {
               saveLead({
@@ -101,9 +98,9 @@ export const chatWithAI = async (req, res) => {
             } catch (leadError) {
               logError(leadError, 'saveLead');
             }
-            
+
             response += `\n\n✅ *RESERVACIÓN CONFIRMADA*\n`;
-            response += `📅 Fecha: ${new Date(reservationResult.reservation.dateTime).toLocaleDateString('es-MX')}\n`;
+            response += `� Fecha: ${new Date(reservationResult.reservation.dateTime).toLocaleDateString('es-MX')}\n`;
             response += `⏰ Hora: ${new Date(reservationResult.reservation.dateTime).toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' })}\n`;
             response += `📍 Ubicación: ${reservationResult.reservation.address}\n`;
             response += `🔗 Link: ${reservationResult.eventLink}`;
@@ -116,15 +113,26 @@ export const chatWithAI = async (req, res) => {
           // ❌ VALIDACIÓN FALLÓ
           logWarning(`Validación fallida: ${validation.error}`, 'chatWithAI');
           response = validation.error;
-          
-          if (validation.missingData && validation.missingData.length > 0) {
+
+          // Si hay sugerencia de horario alternativo, mostrarlo de forma clara
+          if (validation.suggestedDateTime) {
+            const suggested = new Date(validation.suggestedDateTime);
+            response += `\n\nTe propongo el siguiente horario disponible: `;
+            response += `\n📅 Fecha: ${suggested.toLocaleDateString('es-MX')}`;
+            response += `\n⏰ Hora: ${suggested.toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' })}`;
+            response += `\n¿Te gustaría agendar para ese horario?`;
+          }
+
+          // Mostrar todos los datos faltantes correctamente
+          if (Array.isArray(validation.missingData) && validation.missingData.length > 0) {
             response += `\n\nNecesito que me proporciones:\n`;
             validation.missingData.forEach((item, index) => {
               response += `${index + 1}. ${item}\n`;
             });
           }
         }
-      } else if (aiResponse.reservationData && aiResponse.reservationData.missingData && aiResponse.reservationData.missingData.length > 0) {
+      } else if (aiResponse.reservationData && Array.isArray(aiResponse.reservationData.missingData) && aiResponse.reservationData.missingData.length > 0) {
+        // Mostrar todos los datos faltantes correctamente
         response += `\n\n📋 Para completar tu reservación, necesito que me proporciones:\n`;
         aiResponse.reservationData.missingData.forEach((item, index) => {
           response += `${index + 1}. ${item}\n`;

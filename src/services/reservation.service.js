@@ -298,10 +298,17 @@ export async function getAvailableSlots(date, duration = 60) {
       throw new Error('No se pudo inicializar Google Calendar');
     }
 
-    const startOfDay = new Date(date);
+    const now = new Date();
+    const requestedDate = new Date(date);
+    const isToday =
+      requestedDate.getFullYear() === now.getFullYear() &&
+      requestedDate.getMonth() === now.getMonth() &&
+      requestedDate.getDate() === now.getDate();
+
+    const startOfDay = new Date(requestedDate);
     startOfDay.setHours(9, 0, 0, 0); // Abre a las 9 AM
 
-    const endOfDay = new Date(date);
+    const endOfDay = new Date(requestedDate);
     endOfDay.setHours(18, 0, 0, 0); // Cierra a las 6 PM
 
     // Obtener eventos del día
@@ -322,6 +329,12 @@ export async function getAvailableSlots(date, duration = 60) {
     while (currentTime < endOfDay) {
       const slotEnd = new Date(currentTime.getTime() + duration * 60000);
 
+      // Si la fecha es hoy, solo mostrar horarios futuros
+      if (isToday && slotEnd <= now) {
+        currentTime = new Date(currentTime.getTime() + 30 * 60000);
+        continue;
+      }
+
       // Verificar si este slot se superpone con algún evento
       const isAvailable = !events.some((event) => {
         const eventStart = new Date(event.start.dateTime);
@@ -339,10 +352,25 @@ export async function getAvailableSlots(date, duration = 60) {
       currentTime = new Date(currentTime.getTime() + 30 * 60000); // Incrementar por 30 minutos
     }
 
-    return availableSlots;
+    // Si no hay horarios disponibles para hoy y la fecha es hoy, sugerir el siguiente día disponible
+    if (isToday && availableSlots.length === 0) {
+      // Buscar el siguiente día con horarios disponibles (máximo 7 días adelante)
+      for (let i = 1; i <= 7; i++) {
+        const nextDate = new Date(now);
+        nextDate.setDate(now.getDate() + i);
+        const nextSlots = await getAvailableSlots(nextDate, duration);
+        if (nextSlots.length > 0) {
+          return { availableSlots: [], nextAvailable: { date: nextDate.toISOString().split('T')[0], slots: nextSlots } };
+        }
+      }
+      // Si no hay horarios en los próximos 7 días
+      return { availableSlots: [], nextAvailable: null };
+    }
+
+    return { availableSlots, nextAvailable: null };
   } catch (error) {
     console.error('❌ Error obteniendo slots disponibles:', error);
-    return [];
+    return { availableSlots: [], nextAvailable: null };
   }
 }
 
