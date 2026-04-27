@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 import './LeadsViewer.css';
-
+import ChatViewer from './ChatViewer';
 const API_BASE_URL = 'http://localhost:3000';
 
 export default function LeadsViewer() {
@@ -11,7 +11,7 @@ export default function LeadsViewer() {
   const [selectedLead, setSelectedLead] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-
+const [selectedChat, setSelectedChat] = useState(null);
   // Filtros
   const [filterStatus, setFilterStatus] = useState('todos');
   const [searchQuery, setSearchQuery] = useState('');
@@ -85,7 +85,9 @@ export default function LeadsViewer() {
 
     setFilteredLeads(result);
   }, [leads, filterStatus, filterClientType, searchQuery, sortBy, clientTypeMap]);
-
+const openChat = (lead) => {
+  setSelectedChat(lead);
+};
  const fetchLeads = async () => {
   try {
     setLoading(true);
@@ -568,7 +570,10 @@ const getConversationModeUI = (lead) => {
                   {/* 👨 TOMAR CONTROL HUMANO */}
                   <button
                     className="btn-human"
-                    onClick={() => setConversationMode(selectedLead.id, 'human')}
+                    onClick={async () => {
+                      await setConversationMode(selectedLead.id, 'human');
+                      openChat(selectedLead);
+                    }}
                     style={{
                       background: '#4caf50',
                       color: 'white',
@@ -596,11 +601,36 @@ const getConversationModeUI = (lead) => {
                   >
                     🤖 Activar bot
                   </button>
-
+                  {/* 💬 ABRIR CHAT (NUEVO) */}
+                    {selectedLead.conversation_mode === 'human' && (
+                      <button
+                        onClick={() => openChat(selectedLead)}
+                        style={{
+                          background: '#1976d2',
+                          color: 'white',
+                          padding: '8px 12px',
+                          borderRadius: '6px',
+                          border: 'none',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        💬 Abrir chat
+                      </button>
+                    )}
+                    {/* ✅ CHAT OVERLAY */}
+                    {selectedChat && (
+                      <ChatViewer
+                        lead={selectedChat}
+                        onClose={() => setSelectedChat(null)}
+                      />
+                    )}
                 </div>
+                
               </>
             )}
+           
           </>
+          
         ) : (
           <div className="no-selection">
             <p>👈 Selecciona un lead para ver los detalles</p>
@@ -609,4 +639,5 @@ const getConversationModeUI = (lead) => {
       </div>
     </div>
   );
+   
 }
