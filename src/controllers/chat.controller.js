@@ -13,7 +13,7 @@ import { logError, logSuccess, logInfo, logConversation, logWarning } from '../s
 
 export const chatWithAI = async (req, res) => {
   const { message, history, userId } = req.body;
-
+  let fallas = 0;
   if (!message) {
     logWarning('Mensaje vacío recibido', 'chatWithAI');
     return res.status(400).json({ error: 'Mensaje requerido' });
@@ -53,8 +53,15 @@ export const chatWithAI = async (req, res) => {
       userMessage: message,
       conversationHistory: conversationHistory,
       userId: userIdentifier // 🔥 FIX
-    });
-
+    }, fallas);
+    if(aiResponse.fallas && aiResponse.fallas === 2){
+      logWarning(`La IA ha fallado ${aiResponse.fallas} veces para ${userIdentifier}. Considera revisar los logs para más detalles.`, 'chatWithAI');
+      return res.status(500).json({
+        reply: 'En unos momentos se atenderá tu solicitud.',
+        userId: userIdentifier,
+        shouldRetry: false,
+      });
+    }
     // Extraer respuesta y datos de reservación si existen
     let response = aiResponse;
     let reservationResult = null;

@@ -18,26 +18,23 @@ import {
 export async function getLeadsController(req, res) {
   try {
     const { status } = req.query;
-    
-    let leads;
-    if (status) {
-      leads = getLeadsByStatus(status);
-    } else {
-      leads = getAllLeads();
-    }
 
+    const leads = getAllLeads(status || null);
+    console.log(`📊 Leads obtenidos${status ? ` con estado: ${status}` : ''}: ${leads.length}`);
     res.json({
+      success: true,
       total: leads.length,
       leads,
     });
   } catch (error) {
-    console.error('❌ Error obteniendo leads:', error);
     res.status(500).json({
+      success: false,
       error: 'Error al obtener leads',
       details: error.message,
     });
   }
 }
+
 
 /**
  * GET /leads/search

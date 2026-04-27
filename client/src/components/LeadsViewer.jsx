@@ -7,6 +7,7 @@ const API_BASE_URL = 'http://localhost:3000';
 export default function LeadsViewer() {
   const [leads, setLeads] = useState([]);
   const [filteredLeads, setFilteredLeads] = useState([]);
+  const [filterClientType, setFilterClientType] = useState('todos'); // todos, nuevo, recurrente
   const [selectedLead, setSelectedLead] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -27,6 +28,17 @@ export default function LeadsViewer() {
     return () => clearInterval(interval);
   }, []);
 
+  // Calcular tipo de cliente (nuevo/recurrente) por client_phone (vacío/null = siempre nuevo)
+  const clientTypeMap = React.useMemo(() => {
+    const map = {};
+    leads.forEach(lead => {
+      const phone = lead.client_phone && lead.client_phone.trim() !== '' ? lead.client_phone : null;
+      if (!phone) return;
+      map[phone] = (map[phone] || 0) + 1;
+    });
+    return map;
+  }, [leads]);
+
   // Aplicar filtros y búsqueda
   useEffect(() => {
     let result = [...leads];
@@ -34,6 +46,21 @@ export default function LeadsViewer() {
     // Filtrar por estado
     if (filterStatus !== 'todos') {
       result = result.filter(lead => lead.status === filterStatus);
+    }
+
+    // Filtrar por tipo de cliente
+    if (filterClientType !== 'todos') {
+      result = result.filter(lead => {
+        const phone = lead.client_phone && lead.client_phone.trim() !== '' ? lead.client_phone : null;
+        const count = phone ? clientTypeMap[phone] : 0;
+        if (!phone) {
+          // Sin teléfono siempre cuenta como nuevo
+          return filterClientType === 'nuevo';
+        }
+        if (filterClientType === 'nuevo') return count <= 1;
+        if (filterClientType === 'recurrente') return count > 1;
+        return true;
+      });
     }
 
     // Buscar por nombre o teléfono
@@ -53,25 +80,44 @@ export default function LeadsViewer() {
     } else if (sortBy === 'phone') {
       result.sort((a, b) => (a.client_phone || '').localeCompare(b.client_phone || ''));
     } else {
-      result.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+      result.sort((a, b) => b.created_at - a.created_at);
     }
 
     setFilteredLeads(result);
-  }, [leads, filterStatus, searchQuery, sortBy]);
+  }, [leads, filterStatus, filterClientType, searchQuery, sortBy, clientTypeMap]);
 
-  const fetchLeads = async () => {
-    try {
-      setLoading(true);
-      setError(null);
-      const response = await axios.get(`${API_BASE_URL}/leads`);
-      setLeads(response.data.leads || []);
-    } catch (err) {
-      setError(err.response?.data?.error || 'Error cargando leads');
-      console.error('Error:', err);
-    } finally {
-      setLoading(false);
-    }
-  };
+ const fetchLeads = async () => {
+  try {
+    setLoading(true);
+    setError(null);
+
+    const { data } = await axios.get(`${API_BASE_URL}/leads`);
+
+    if (!data.success) throw new Error(data.error);
+
+    const normalized = (data.leads || []).map(lead => ({
+      ...lead,
+      client_name: lead.client_name || 'Sin nombre',
+      client_phone: lead.client_phone || '',
+      client_email: lead.client_email || '',
+      service_type: lead.service_type || '',
+      address: lead.address || '',
+      city: lead.city || '',
+      status: lead.status || 'nuevo',
+      created_at: lead.created_at || null,
+      updated_at: lead.updated_at || null
+    }));
+
+    setLeads(normalized);
+
+  } catch (err) {
+    setError(err.message || 'Error cargando leads');
+  } finally {
+    setLoading(false);
+  }
+};
+
+
 
   const changeLeadStatus = async (leadId, newStatus) => {
     try {
@@ -187,6 +233,18 @@ export default function LeadsViewer() {
           </div>
 
           <div className="filter-group">
+            <label>Cliente:</label>
+            <select
+              value={filterClientType}
+              onChange={e => setFilterClientType(e.target.value)}
+            >
+              <option value="todos">Todos</option>
+              <option value="nuevo">🆕 Nuevo</option>
+              <option value="recurrente">🔁 Recurrente</option>
+            </select>
+          </div>
+
+          <div className="filter-group">
             <label>Ordenar por:</label>
             <select value={sortBy} onChange={(e) => setSortBy(e.target.value)}>
               <option value="recent">Más recientes</option>
@@ -219,9 +277,16 @@ export default function LeadsViewer() {
                   </span>
                 </div>
                 <div className="lead-info">
-                  <div className="lead-phone">📞 {lead.client_phone}</div>
+                  <div className="lead-phone">📞 {lead.client_phone && lead.client_phone.trim() !== '' ? lead.client_phone : 'Sin teléfono'}</div>
                   <div className="lead-service">🔧 {lead.service_type || 'N/A'}</div>
                   <div className="lead-date">{formatDate(lead.created_at)}</div>
+                  <div className="lead-clienttype">
+                    {lead.client_phone && lead.client_phone.trim() !== '' && clientTypeMap[lead.client_phone] > 1 ? (
+                      <span title="Cliente recurrente">🔁</span>
+                    ) : (
+                      <span title="Cliente nuevo">🆕</span>
+                    )}
+                  </div>
                 </div>
               </div>
             ))}

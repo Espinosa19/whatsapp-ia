@@ -1,7 +1,282 @@
-const { useState, useEffect } = React;
+const { useState, useEffect, useRef } = React;
 
 const API_BASE_URL = 'http://localhost:3000';
 
+function LeadsView() {
+  const [leads, setLeads] = useState([]);
+  const [selectedLead, setSelectedLead] = useState(null);
+  const [leadDetail, setLeadDetail] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [loadingMessages, setLoadingMessages] = useState(false);
+  const [error, setError] = useState(null);
+  const [filter, setFilter] = useState('all');
+
+  const chatRef = useRef(null);
+
+  // 🔹 cargar leads
+  useEffect(() => {
+    fetchLeads();
+  }, []);
+
+  // 🔹 auto scroll chat
+  useEffect(() => {
+    if (chatRef.current) {
+      chatRef.current.scrollTo({
+        top: chatRef.current.scrollHeight,
+        behavior: 'smooth'
+      });
+    }
+  }, [messages]);
+
+  const fetchLeads = async () => {
+    try {
+      setLoading(true);
+      const res = await axios.get(`${API_BASE_URL}/leads`);
+      setLeads(res.data.leads || res.data || []);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // 🔥 seleccionar lead (igual que HistoryViewer)
+  const handleSelectLead = async (lead) => {
+    try {
+      setSelectedLead(lead);
+      setMessages([]);
+      setLeadDetail(null);
+      setError(null);
+      setLoadingMessages(true);
+
+      // 1️⃣ detalle
+      const detailRes = await axios.get(`${API_BASE_URL}/leads/${lead.id}`);
+      const detail = detailRes.data;
+      setLeadDetail(detail);
+
+      // 2️⃣ obtener userId correctamente
+      const userId =
+        detail?.userId ||
+        detail?.user_id ||
+        detail?.phone ||
+        lead?.phone;
+
+      if (!userId) throw new Error('No userId disponible');
+
+      // 3️⃣ historial
+      const res = await axios.get(`${API_BASE_URL}/db/messages`, {
+        params: { userId }
+      });
+
+      setMessages(res.data.messages || []);
+
+    } catch (err) {
+      console.error(err);
+      setError('Error cargando conversación');
+    } finally {
+      setLoadingMessages(false);
+    }
+  };
+
+  const filteredLeads = leads.filter(l =>
+    filter === 'all' ? true : l.status === filter
+  );
+
+  const statusColor = (status) => ({
+    nuevo: '#ff9800',
+    contactado: '#2196f3',
+    convertido: '#4caf50',
+    cancelado: '#f44336'
+  }[status] || '#999');
+
+  return React.createElement('div', {
+    style: {
+      display: 'flex',
+      flexDirection: 'column',
+      height: '100vh',
+      fontFamily: 'Arial'
+    }
+  },
+
+    // 🧱 GRID PRINCIPAL
+    React.createElement('div', {
+      style: {
+        display: 'grid',
+        gridTemplateColumns: '24% 40% 36%',
+        flex: 1,
+        overflow: 'hidden'
+      }
+    },
+
+      // 🧍 COLUMNA 1 - LEADS
+      React.createElement('div', {
+        style: {
+          borderRight: '1px solid #ddd',
+          padding: '10px',
+          overflowY: 'auto'
+        }
+      },
+
+        React.createElement('h3', null, 'Leads'),
+
+        ['all', 'nuevo', 'contactado', 'convertido', 'cancelado'].map(status =>
+          React.createElement('button', {
+            key: status,
+            onClick: () => setFilter(status),
+            style: {
+              width: '100%',
+              marginBottom: '5px',
+              padding: '6px',
+              background: filter === status ? '#667eea' : '#eee',
+              border: 'none',
+              cursor: 'pointer'
+            }
+          }, status)
+        ),
+
+        filteredLeads.map(lead =>
+          React.createElement('div', {
+            key: lead.id,
+            onClick: () => handleSelectLead(lead),
+            style: {
+              padding: '10px',
+              marginTop: '8px',
+              cursor: 'pointer',
+              background:
+                selectedLead?.id === lead.id ? '#eef2ff' : '#fff',
+              borderLeft: `4px solid ${statusColor(lead.status)}`
+            }
+          },
+            React.createElement('strong', null, lead.client_name || 'Sin nombre'),
+            React.createElement('div', null, lead.status)
+          )
+        )
+      ),
+
+      // 💬 COLUMNA 2 - CHAT
+      React.createElement('div', {
+        style: {
+            display: 'flex',
+            flexDirection: 'column',
+            height: '80%',     // 🔥 obligatorio
+            minHeight: 0        // 🔥 clave en layouts flex/grid
+            }
+      },
+
+        !selectedLead
+          ? React.createElement('div', { style: { padding: '20px' } }, 'Selecciona un lead')
+          : [
+              // HEADER
+              React.createElement('div', {
+                style: { padding: '10px', borderBottom: '1px solid #ddd' }
+              },
+                React.createElement('strong', null, selectedLead.client_name)
+              ),
+
+              // MENSAJES
+              React.createElement('div', {
+                ref: chatRef,
+                style: {
+                    flex: 1,
+                    minHeight: 0,        // 🔥 ESTE ES EL MÁS IMPORTANTE
+                    padding: '15px',
+                    overflowY: 'auto',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '10px'
+                    }
+              },
+
+                loadingMessages
+                  ? React.createElement('div', null, 'Cargando mensajes...')
+                  : messages.length === 0
+                    ? React.createElement('div', null, 'Sin mensajes')
+                    : messages.map((msg, i) =>
+                        React.createElement('div', {
+                          key: i,
+                          style: {
+                            background: msg.role === 'assistant' ? '#eee' : '#3b82f6',
+                            color: msg.role === 'assistant' ? '#000' : 'white',
+                            padding: '10px',
+                            borderRadius: '10px',
+                            alignSelf:
+                              msg.role === 'assistant'
+                                ? 'flex-start'
+                                : 'flex-end',
+                            maxWidth: '70%'
+                          }
+                        }, msg.content)
+                      )
+              ),
+
+              // INPUT
+              React.createElement('div', {
+                style: {
+                  display: 'flex',
+                  borderTop: '1px solid #ddd',
+                  padding: '10px'
+                }
+              },
+                React.createElement('input', {
+                  placeholder: 'Escribe mensaje...',
+                  style: { flex: 1, padding: '10px' }
+                }),
+                React.createElement('button', {
+                  style: {
+                    marginLeft: '10px',
+                    background: '#3b82f6',
+                    color: 'white',
+                    border: 'none',
+                    padding: '10px',
+                    cursor: 'pointer'
+                  }
+                }, 'Enviar')
+              )
+            ]
+      ),
+
+      // 📊 COLUMNA 3 - DETALLES
+      React.createElement('div', {
+        style: {
+          borderLeft: '1px solid #ddd',
+          padding: '15px',
+          overflowY: 'auto'
+        }
+      },
+
+        !selectedLead
+          ? React.createElement('div', null, 'Sin lead seleccionado')
+          : [
+              React.createElement('h3', null, 'Datos del cliente'),
+
+              React.createElement('p', null, 'Nombre: ', leadDetail?.client_name),
+              React.createElement('p', null, 'Tel: ', leadDetail?.phone || 'N/A'),
+              React.createElement('p', null, 'Dirección: ', leadDetail?.address || 'N/A'),
+
+              btn('Agendar visita', '#22c55e'),
+              btn('Regresar a BOT', '#f59e0b'),
+              btn('Cerrar lead', '#ef4444')
+            ]
+      )
+    )
+  );
+}
+
+// 🔘 helper botones
+function btn(text, color) {
+  return React.createElement('button', {
+    style: {
+      width: '100%',
+      marginTop: '10px',
+      padding: '10px',
+      background: color,
+      color: 'white',
+      border: 'none',
+      cursor: 'pointer'
+    }
+  }, text);
+}
 // ===== HistoryViewer Component =====
 function HistoryViewer() {
   const [users, setUsers] = useState([]);
@@ -294,10 +569,7 @@ function App() {
     React.createElement('main', { className: 'app-main' },
       currentView === 'dashboard' && React.createElement(Dashboard),
       currentView === 'history' && React.createElement(HistoryViewer),
-      currentView === 'leads' && React.createElement('div', { style: { padding: '20px', color: '#666' } },
-        React.createElement('h2', null, '👥 Leads'),
-        React.createElement('p', null, 'Vista de Leads disponible en el navegador moderno (http://localhost:3001)')
-      )
+      currentView === 'leads' && React.createElement(LeadsView)
     )
   );
 }

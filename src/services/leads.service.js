@@ -1,13 +1,9 @@
 import { getDatabase } from '../config/database.config.js';
-
-/**
- * Guarda un nuevo lead en la base de datos
- */
 export function saveLead({
   userId,
   clientName,
-  clientPhone,
-  clientEmail,
+  clientPhone = null,
+  clientEmail = null,
   serviceType,
   address,
   city,
@@ -22,7 +18,7 @@ export function saveLead({
     const db = getDatabase();
 
     const stmt = db.prepare(`
-      INSERT OR REPLACE INTO leads (
+      INSERT INTO leads (
         user_id,
         client_name,
         client_phone,
@@ -38,10 +34,20 @@ export function saveLead({
         calendar_link,
         created_at,
         updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 
-        COALESCE((SELECT created_at FROM leads WHERE user_id = ? AND client_phone = ?), CURRENT_TIMESTAMP),
-        CURRENT_TIMESTAMP
-      )
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      ON CONFLICT(user_id, client_phone) DO UPDATE SET
+        client_name = excluded.client_name,
+        client_email = excluded.client_email,
+        service_type = excluded.service_type,
+        address = excluded.address,
+        city = excluded.city,
+        status = excluded.status,
+        notes = excluded.notes,
+        preferred_date = excluded.preferred_date,
+        preferred_time = excluded.preferred_time,
+        event_id = excluded.event_id,
+        calendar_link = excluded.calendar_link,
+        updated_at = CURRENT_TIMESTAMP
     `);
 
     stmt.run(
@@ -57,18 +63,16 @@ export function saveLead({
       preferredDate,
       preferredTime,
       eventId,
-      calendarLink,
-      userId,
-      clientPhone
+      calendarLink
     );
 
-    console.log(`✅ Lead guardado: ${clientName} (${clientPhone})`);
     return { success: true };
   } catch (error) {
-    console.error('❌ Error guardando lead:', error);
+    console.error(error);
     throw error;
   }
 }
+
 
 /**
  * Obtiene todos los leads

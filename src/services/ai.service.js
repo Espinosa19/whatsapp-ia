@@ -3,7 +3,7 @@ import path from 'path';
 import { getOpenAIInstance } from '../config/openai.config.js';
 import { getRedisClient } from '../config/redis.config.js';
 import { createGoogleCalendarEvent } from '../services/google-calendar.service.js';
-export async function generateAIResponse({ userMessage, conversationHistory = [], userId }) {
+export async function generateAIResponse({ userMessage, conversationHistory = [], userId },fallas = 0) {
   try {
     const promptPath = path.resolve('src/prompts/assistant.txt');
     const systemPrompt = await fs.readFile(promptPath, 'utf-8');
@@ -18,7 +18,7 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
     const clientEmailKey = userId ? `clientEmail:${userId}` : null;
     const addressKey = userId ? `address:${userId}` : null;
     const pendingReservationKey = userId ? `pendingReservation:${userId}` : null;
-
+    fallas = fallas || 0;
     // =========================
     // 🧠 EXTRACCIÓN SIMPLE
     // =========================
@@ -169,7 +169,7 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
 
   } catch (error) {
     console.error('❌ Error IA:', error);
-    return { reply: 'Ocurrió un error. Intenta nuevamente.' };
+    return { reply: 'Ocurrió un error. Intenta nuevamente.',fallas: fallas + 1 };
   }
 }
 
