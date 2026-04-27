@@ -117,8 +117,30 @@ export function getLeadsByStatus(status) {
     console.error('❌ Error obteniendo leads por estado:', error);
     throw error;
   }
-}
+}export function updateConversationMode(leadId, mode) {
+  try {
+    const db = getDatabase();
 
+    const stmt = db.prepare(`
+      UPDATE leads 
+      SET conversation_mode = ?, updated_at = CURRENT_TIMESTAMP 
+      WHERE id = ?
+    `);
+
+    const result = stmt.run(mode, leadId);
+
+    console.log(`✅ Lead ${leadId} actualizado a modo: ${mode}`);
+
+    return {
+      success: true,
+      changes: result.changes
+    };
+
+  } catch (error) {
+    console.error('❌ Error actualizando modo:', error);
+    throw error;
+  }
+}
 /**
  * Obtiene un lead específico
  */

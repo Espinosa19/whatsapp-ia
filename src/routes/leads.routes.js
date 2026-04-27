@@ -9,6 +9,7 @@ import {
   updateLeadStatusController,
   updateLeadController,
   deleteLeadController,
+  updateConversationModeController
 } from '../controllers/leads.controller.js';
 
 const router = Router();
@@ -24,7 +25,7 @@ router.get('/', getLeadsController);
  * Obtener estadísticas de leads
  */
 router.get('/stats', getLeadsStatsController);
-
+router.put('/:id/mode',updateConversationModeController);
 /**
  * GET /leads/search
  * Buscar leads por criterios

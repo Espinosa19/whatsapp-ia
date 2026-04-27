@@ -9,6 +9,7 @@ import {
   deleteLead,
   getLeadsStats,
   searchLeads,
+  updateConversationMode
 } from '../services/leads.service.js';
 
 /**
@@ -85,7 +86,43 @@ export async function getLeadsStatsController(req, res) {
     });
   }
 }
+export async function updateConversationModeController(req, res) {
+  try {
+    const { id } = req.params;
+    const { mode } = req.body;
 
+    // ✅ Validación
+    if (!['bot', 'human'].includes(mode)) {
+      return res.status(400).json({
+        error: 'Modo inválido. Valores permitidos: bot, human'
+      });
+    }
+
+    const result = updateConversationMode(id, mode);
+
+    // 🔥 Validar si realmente se actualizó
+    if (result.changes === 0) {
+      return res.status(404).json({
+        error: 'Lead no encontrado'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Modo actualizado a: ${mode}`,
+      leadId: id,
+      mode
+    });
+
+  } catch (error) {
+    console.error('❌ Error actualizando modo:', error);
+
+    res.status(500).json({
+      error: 'Error al actualizar modo de conversación',
+      details: error.message
+    });
+  }
+}
 /**
  * GET /leads/:leadId
  * Obtiene un lead específico
@@ -288,4 +325,5 @@ export default {
   updateLeadStatusController,
   updateLeadController,
   deleteLeadController,
+  updateConversationModeController
 };
