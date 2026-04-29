@@ -1,5 +1,5 @@
 import { generateAIResponse } from '../services/ai.service.js';
-import { validateAndFormatReservationData } from '../services/ai.service.js';
+import { validateAndFormatReservationData,generateNotesWithAI } from '../services/ai.service.js';
 import { createReservation, getUserReservations } from '../services/reservation.service.js';
 import {
   getConversationHistory,
@@ -7,22 +7,26 @@ import {
   formatHistoryForOpenAI,
   clearConversationHistory
 } from '../services/conversation.service.js';
+import { getRedisClient } from '../config/redis.config.js';
+
 import { saveMessageToDB } from '../services/database.service.js';
 import { saveLead } from '../services/leads.service.js';
 import { logError, logSuccess, logInfo, logConversation, logWarning } from '../services/logger.service.js';
 
 export const chatWithAI = async (req, res) => {
   const { message, history, userId } = req.body;
-  let fallas = 0;
+  const userIdentifier = userId || 'postman-user-default';
+ 
   if (!message) {
     logWarning('Mensaje vacío recibido', 'chatWithAI');
     return res.status(400).json({ error: 'Mensaje requerido' });
   }
-
   // Usar userId del body o generar uno por defecto para Postman
-  const userIdentifier = userId || 'postman-user-default';
-
+  
   try {
+      const redis = await getRedisClient();
+      const fallasKey = `fallas:${userIdentifier}`;
+      const fallasGuardadas = parseInt(await redis.get(fallasKey)) || 0;
     // 📝 Loguear conversación entrante
     logConversation(userIdentifier, 'user', message, 'ENTRADA');
 
@@ -46,26 +50,87 @@ export const chatWithAI = async (req, res) => {
       const savedHistory = await getConversationHistory(userIdentifier);
       conversationHistory = formatHistoryForOpenAI(savedHistory);
     }
+    let aiResponse;
 
     // 🤖 Generar respuesta
     logInfo(`Generando respuesta para ${userIdentifier}`, 'chatWithAI');
-   const aiResponse = await generateAIResponse({
-      userMessage: message,
-      conversationHistory: conversationHistory,
-      userId: userIdentifier // 🔥 FIX
-    }, fallas);
-    if(aiResponse.fallas && aiResponse.fallas === 2){
-      logWarning(`La IA ha fallado ${aiResponse.fallas} veces para ${userIdentifier}. Considera revisar los logs para más detalles.`, 'chatWithAI');
+    try {
+
+      aiResponse = await generateAIResponse({
+          userMessage: message,
+          conversationHistory,
+          userId: userIdentifier
+        });
+      await redis.del(fallasKey);
+    } catch (error) {
+      logError(error, 'generateAIResponse');
+      await redis.set(fallasKey, fallasGuardadas + 1, 'EX', 60 * 60); // Incrementar fallas y expirar en 1 hora
       return res.status(500).json({
-        reply: 'En unos momentos se atenderá tu solicitud.',
+        reply: 'Ocurrió un error. Intenta nuevamente.',
+        error: 'Error al generar respuesta de IA',
+        details: error.message,
         userId: userIdentifier,
-        shouldRetry: false,
+        shouldRetry: true,
       });
+      if (aiResponse.fallas >= 2) {
+
+        logWarning(`IA falló ${aiResponse.fallas} veces para ${userIdentifier}`, 'chatWithAI');
+
+
+        const [
+          redisName,
+          redisEmail,
+          redisAddress,
+          redisPhone
+        ] = await Promise.all([
+          redis.get(`clientName:${userIdentifier}`),
+          redis.get(`clientEmail:${userIdentifier}`),
+          redis.get(`address:${userIdentifier}`),
+          redis.get(`clientPhone:${userIdentifier}`)
+        ]);
+
+        const existingLead = await getLeadByUserId(userIdentifier);
+
+        const leadData = {
+          userId: userIdentifier,
+
+          clientName: redisName || 'Sin nombre',
+          clientPhone: redisPhone || '',
+          clientEmail: redisEmail || '',
+          serviceType: '',
+          address: redisAddress || '',
+          city: '',
+
+          status: 'falla',
+          conversation_mode: 'human',
+
+          notes: (existingLead?.notes || '') + '\n⚠️ IA falló múltiples veces',
+
+          preferredDate: '',
+          preferredTime: '',
+
+          eventId: null,
+          calendarLink: null,
+        };
+
+        if (existingLead) {
+          await updateLead(existingLead.id, leadData);
+        } else {
+          await saveLead(leadData);
+        }
+
+        return res.status(200).json({
+          reply: 'Un asesor humano continuará contigo en breve.',
+          userId: userIdentifier,
+          forceHuman: true
+        });
+      }
     }
+    
     // Extraer respuesta y datos de reservación si existen
     let response = aiResponse;
     let reservationResult = null;
-
+  
     if (
       typeof aiResponse === 'object' &&
       aiResponse.reservationRequest === true &&
@@ -76,14 +141,20 @@ export const chatWithAI = async (req, res) => {
       
       // 📅 Procesar solicitud de reservación
       if (aiResponse.reservationData && aiResponse.reservationData.shouldReserve) {
+        
         logInfo('Validando datos de reservación', 'chatWithAI');
-        // Obtener citas existentes del usuario para validar disponibilidad
+
+        const notes = await generateNotesWithAI(conversationHistory);
         const existingReservations = await getUserReservations(userIdentifier);
+        const enrichedData = {
+          ...aiResponse.reservationData,
+          notes: notes|| '',
+        };
+
         const validation = validateAndFormatReservationData(
-          aiResponse.reservationData,
+          enrichedData,
           existingReservations
         );
-        console.log('Validación de reservación:', validation);
         if (validation.valid) {
           // ✅ VALIDACIÓN PASÓ - Crear reservación
           logInfo('Datos validados, creando reservación', 'chatWithAI');

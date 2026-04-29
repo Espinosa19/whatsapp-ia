@@ -16,6 +16,7 @@ const [selectedChat, setSelectedChat] = useState(null);
   const [filterStatus, setFilterStatus] = useState('todos');
   const [searchQuery, setSearchQuery] = useState('');
   const [sortBy, setSortBy] = useState('recent'); // recent, name, phone
+  const [showMoreFilters, setShowMoreFilters] = useState(false); // Mostrar más filtros
 
   // Modal de edición
   const [editingLead, setEditingLead] = useState(null);
@@ -260,7 +261,12 @@ const getConversationModeUI = (lead) => {
             onChange={(e) => setSearchQuery(e.target.value)}
           />
 
-          <div className="filter-group">
+                   
+          {/* Filtros avanzados, ocultos por defecto */}
+          {showMoreFilters && (
+            
+            <div className="advanced-filters">
+              <div className="filter-group">
             <label>Estado:</label>
             <select
               value={filterStatus}
@@ -273,8 +279,7 @@ const getConversationModeUI = (lead) => {
               <option value="cancelado">❌ Cancelado</option>
             </select>
           </div>
-
-          <div className="filter-group">
+              <div className="filter-group">
             <label>Cliente:</label>
             <select
               value={filterClientType}
@@ -294,6 +299,29 @@ const getConversationModeUI = (lead) => {
               <option value="phone">Teléfono</option>
             </select>
           </div>
+
+              {/* Aquí puedes agregar más filtros avanzados */}
+              <div className="filter-group">
+                <label>Ciudad:</label>
+                <input
+                  type="text"
+                  placeholder="Ciudad..."
+                  value={''}
+                  onChange={() => {}}
+                  disabled
+                  style={{ background: '#f5f5f5', color: '#aaa' }}
+                  title="Ejemplo de filtro avanzado (implementa la lógica si lo necesitas)"
+                />
+              </div>
+            </div>
+          )}
+          <button
+            className="show-more-filters-btn"
+            style={{ marginTop: '10px', background: 'none', border: 'none', color: '#1976d2', cursor: 'pointer', fontWeight: 600 }}
+            onClick={() => setShowMoreFilters(v => !v)}
+          >
+            {showMoreFilters ? '− Menos filtros' : '+ Más filtros'}
+          </button>
         </div>
 
         {/* LISTA DE LEADS */}

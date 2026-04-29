@@ -3,14 +3,14 @@ import path from 'path';
 import { getOpenAIInstance } from '../config/openai.config.js';
 import { getRedisClient } from '../config/redis.config.js';
 import { createGoogleCalendarEvent } from '../services/google-calendar.service.js';
-export async function generateAIResponse({ userMessage, conversationHistory = [], userId },fallas = 0) {
+
+export async function generateAIResponse({ userMessage, conversationHistory = [], userId }) {
   try {
     const promptPath = path.resolve('src/prompts/assistant.txt');
     const systemPrompt = await fs.readFile(promptPath, 'utf-8');
 
     const analysis = await analyzeUserMessage(userMessage);
     const redis = await getRedisClient();
-
     // =========================
     // 🔑 REDIS KEYS
     // =========================
@@ -18,26 +18,56 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
     const clientEmailKey = userId ? `clientEmail:${userId}` : null;
     const addressKey = userId ? `address:${userId}` : null;
     const pendingReservationKey = userId ? `pendingReservation:${userId}` : null;
-    fallas = fallas || 0;
+    const phaseKey = `reservationPhase:${userId}`;
     // =========================
     // 🧠 EXTRACCIÓN SIMPLE
     // =========================
-    const nameMatch = userMessage.match(/(mi nombre es|soy|me llamo)\s+([a-záéíóúüñ\s]+)/i);
+    let lowerUserMessage = userMessage.toLowerCase();
+    const messageCount = conversationHistory.length;
+    let detectedName = null;
+    if (messageCount <= 2) {
+      const lowerUserMessage = userMessage.toLowerCase();
+
+      const nameMatch = lowerUserMessage.match(
+        /\b(mi nombre es|me llamo|soy|yo soy|me dicen|puedes llamarme|soy el|soy la)\b\s*([a-záéíóúüñ\s]{2,40})/i
+      );
+
+      if (nameMatch) {
+        detectedName = nameMatch[2].trim();
+      } else {
+        // 🔥 caso: solo mandan nombre
+        detectedName = verificarSiElMensajeEsSoloNombre(userMessage);
+      }
+    }
     const emailMatch = userMessage.match(/([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)/);
 
     // 🔥 MEJOR DETECCIÓN DE DIRECCIÓN
+    let detectedAddress = null;
+
+    // Caso con frase clara
     const addressMatch = userMessage.match(
-      /(calle|avenida|av\.?|colonia|col\.?|cp|c\.p\.?|número|numero|mz|manzana|lote|int|interior).+/i
+      /(mi dirección es|vivo en|estoy en|me ubico en|queda en|ubicado en)\s+(.+)/i
     );
 
-    const detectedName = nameMatch?.[2]?.trim() || null;
+    if (addressMatch) {
+      detectedAddress = addressMatch[2].trim();
+    } else {
+      // 🔥 fallback: detectar si parece dirección
+      const looksLikeAddress =
+        /(calle|avenida|av\.?|colonia|col\.?|cp|c\.p\.?|número|numero|interior|int|mz|lote)/i
+          .test(userMessage);
+
+      if (looksLikeAddress && userMessage.length > 10) {
+        detectedAddress = userMessage.trim();
+      }
+    }
     const detectedEmail = emailMatch?.[1] || null;
-    const detectedAddress = addressMatch?.[0]?.trim() || null;
+    const clientName = clientNameKey ? await redis.get(clientNameKey) : null;
 
     // =========================
     // 💾 GUARDAR EN REDIS
     // =========================
-    if (clientNameKey && detectedName) {
+    if (!clientName && detectedName) {
       await redis.setEx(clientNameKey, 3600, detectedName);
     }
 
@@ -52,37 +82,47 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
     // =========================
     // 🔄 RECUPERAR
     // =========================
-    const clientName = clientNameKey ? await redis.get(clientNameKey) : null;
     const clientEmail = clientEmailKey ? await redis.get(clientEmailKey) : null;
+    let phase = await redis.get(phaseKey);
+    // default
+    if (!phase) phase = 'phase1';
     const address = addressKey ? await redis.get(addressKey) : null;
-
-    const wantsAppointment =
-      /visita|cita|agendar|agenda|instalación|revisión|que vayan/i.test(userMessage);
-
+    const confirmAppointment =
+      /\b(si|sí|ok|vale|va|dale|perfecto|me parece|claro|por favor|hazlo|agendalo|agéndalo)\b.*\b(cita|visita|agendar|agenda|programar|ir)\b/i
+        .test(userMessage);
+    const negativeSoft =
+      /(precio|cotización|información|info|solo estoy viendo|comparando|quiero saber)/i
+        .test(userMessage);
+    const intentType = revisarSiEsSolicitudDeReserva(userMessage);
     let reservationData = null;
 
+    if (intentType === 'soft' && negativeSoft) {
+      return {
+        reply: `Entiendo que estás buscando información. ¿Quieres que te ayude a agendar una visita técnica para revisar tu caso?`,
+        reservationRequest: false,
+        reservationData: null
+      };
+    }
     // =========================
     // 🧠 FLUJO DE RESERVACIÓN
     // =========================
-    if (wantsAppointment) {
+    if ((intentType === 'hard' && !negativeSoft) || (confirmAppointment && !negativeSoft)) {
       reservationData = await detectAndExtractReservationData(userMessage, conversationHistory);
-
       reservationData = {
         ...reservationData,
         clientName: clientName || reservationData.clientName,
         clientEmail: clientEmail || reservationData.clientEmail,
         address: address || reservationData.address,
       };
+      const { missingPhase1, missingPhase2 } = buildMissing(reservationData);
 
-      const missing = [];
+      if (
+        missingPhase1.length === 0 &&
+        missingPhase2.length === 0 &&
+        reservationData.shouldReserve
+      ) {
+        await redis.del(phaseKey);
 
-      if (!reservationData.clientName) missing.push("Nombre completo");
-      if (!reservationData.address) missing.push("Dirección completa");
-      if (!reservationData.preferredDate) missing.push("Fecha");
-      if (!reservationData.preferredTime) missing.push("Hora");
-
-      // 🔥 SI YA TIENE TODO → SOLO AVISA (NO AGENDA)
-      if (missing.length === 0 && reservationData.shouldReserve) {
         return {
           reply: `Perfecto 👍 ya tengo todos los datos para agendar tu visita.`,
           reservationRequest: true,
@@ -90,16 +130,71 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
         };
       }
 
-      // ❌ FALTAN DATOS
-      await redis.setEx(pendingReservationKey, 900, JSON.stringify(reservationData));
+      if (reservationData && typeof reservationData === 'object') {
+        await redis.setEx(
+          pendingReservationKey,
+          900,
+          JSON.stringify(reservationData)
+        );
+      }
+      // =========================
+      // 🟢 FASE 1 → pedir fecha/hora
+      // =========================
+      if (phase === 'phase1') {
 
-      return {
-        reply: `Para agendar tu visita necesito:\n\n${missing.map((m, i) => `${i + 1}. ${m}`).join('\n')}\n\n¿Me apoyas con esos datos? 😊`,
-        reservationRequest: false,
-        reservationData: {
-          missingData: missing
+        if (missingPhase1.length > 0) {
+
+          await redis.setEx(phaseKey, 900, 'phase1');
+
+          return {
+            reply: `Perfecto 👍 puedo ayudarte con la visita técnica.
+Solo dime qué día y a qué hora te queda mejor 📅⏰  
+Por ejemplo: "mañana a las 5pm" o "el viernes por la mañana`,
+            reservationRequest: false,
+            reservationData: {
+              ...reservationData,
+              missingData: missingPhase1
+            }
+          };
         }
-      };
+        // 🔥 pasar a fase 2
+        await redis.setEx(phaseKey, 900, 'phase2');
+      }
+      // =========================
+      // 🔵 FASE 2 → pedir datos personales
+      // =========================
+      else if (phase === 'phase2') {
+
+        if (missingPhase2.length > 0) {
+
+          await redis.setEx(phaseKey, 900, 'phase2');
+          let reply = `Excelente 👍 ya casi terminamos.\n\n`;
+
+          if (missingPhase2.includes("Nombre completo") && missingPhase2.includes("Dirección completa")) {
+            reply += `Solo necesito tu nombre y la dirección donde se realizará la visita 📍`;
+          }
+          else if (missingPhase2.includes("Nombre completo")) {
+            reply += `Solo me falta tu nombre para continuar 🙂`;
+          }
+          else if (missingPhase2.includes("Dirección completa")) {
+            reply += `¿Me compartes la dirección donde se realizará la visita? 📍`;
+          }
+
+          // ejemplo solo si falta dirección
+          if (missingPhase2.includes("Dirección completa")) {
+            reply += `\n\nEjemplo: "Av Reforma 500, Colonia Centro"`;
+          }
+
+          return {
+            reply,
+            reservationRequest: false,
+            reservationData: {
+              ...reservationData,
+              missingData: missingPhase2
+            }
+          };
+        }
+      }
     }
 
     // =========================
@@ -119,15 +214,10 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
         address: detectedAddress || address || pending.address,
         clientEmail: detectedEmail || clientEmail || pending.clientEmail,
       };
-
-      const missing = [];
-
-      if (!reservationData.clientName) missing.push("Nombre completo");
-      if (!reservationData.address) missing.push("Dirección completa");
-      if (!reservationData.preferredDate) missing.push("Fecha");
-      if (!reservationData.preferredTime) missing.push("Hora");
-
-      if (missing.length === 0 && reservationData.shouldReserve) {
+      const { missingPhase1, missingPhase2 } = buildMissing(reservationData);
+      if (missingPhase1.length === 0 &&
+        missingPhase2.length === 0 &&
+        reservationData.shouldReserve) {
         if (pendingReservationKey) {
           await redis.del(pendingReservationKey);
         }
@@ -148,15 +238,74 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
       }
 
 
-      return {
-        reply: `Aún me faltan estos datos:\n\n${missing.map((m, i) => `${i + 1}. ${m}`).join('\n')}`,
-        reservationRequest: false,
-        reservationData: {
-          missingData: missing
-        }
-      };
-    }
+      if (phase === 'phase1') {
 
+        if (missingPhase1.length > 0) {
+
+          await redis.setEx(phaseKey, 900, 'phase1');
+
+          return {
+            reply: `Perfecto 👍 puedo ayudarte con la visita técnica.
+Solo dime qué día y a qué hora te queda mejor 📅⏰  
+Por ejemplo: "mañana a las 5pm" o "el viernes por la mañana`,
+            reservationRequest: false,
+            reservationData: {
+              ...reservationData,
+              missingData: missingPhase1
+            }
+          };
+        }
+        // 🔥 pasar a fase 2
+        await redis.setEx(phaseKey, 900, 'phase2');
+      }
+      // =========================
+      // 🔵 FASE 2 → pedir datos personales
+      // =========================
+      if (phase === 'phase2') {
+
+        if (missingPhase2.length > 0) {
+
+          await redis.setEx(phaseKey, 900, 'phase2');
+          let reply = `Excelente 👍 ya casi terminamos.\n\n`;
+
+          if (missingPhase2.includes("Nombre completo") && missingPhase2.includes("Dirección completa")) {
+            reply += `Solo necesito tu nombre y la dirección donde se realizará la visita 📍`;
+          }
+          else if (missingPhase2.includes("Nombre completo")) {
+            reply += `Solo me falta tu nombre para continuar 🙂`;
+          }
+          else if (missingPhase2.includes("Dirección completa")) {
+            reply += `¿Me compartes la dirección donde se realizará la visita? 📍`;
+          }
+
+          // ejemplo solo si falta dirección
+          if (missingPhase2.includes("Dirección completa")) {
+            reply += `\n\nEjemplo: "Av Reforma 500, Colonia Centro"`;
+          }
+
+          return {
+            reply,
+            reservationRequest: false,
+            reservationData: {
+              ...reservationData,
+              missingData: missingPhase2
+            }
+          };
+        }
+      }
+
+    }
+    const now = new Date();
+
+    const dateTime = {
+      date: now.toLocaleDateString('en-CA'), // formato ISO local
+      time: now.toLocaleTimeString('es-MX', {
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false
+      }),
+      timestamp: now.getTime()
+    };
     // =========================
     // 🤖 RESPUESTA NORMAL
     // =========================
@@ -164,16 +313,81 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
       userMessage,
       conversationHistory,
       systemPrompt,
-      analysis
+      analysis,
+      dateTime
     });
 
   } catch (error) {
     console.error('❌ Error IA:', error);
-    return { reply: 'Ocurrió un error. Intenta nuevamente.',fallas: fallas + 1 };
+    return { reply: 'Ocurrió un error. Intenta nuevamente.' };
   }
 }
+function buildMissing(reservationData) {
+  const missingPhase1 = [];
+  const missingPhase2 = [];
 
+  if (!reservationData.preferredDate) missingPhase1.push("Fecha");
+  if (!reservationData.preferredTime) missingPhase1.push("Hora");
 
+  if (!reservationData.clientName) missingPhase2.push("Nombre completo");
+  if (!reservationData.address) missingPhase2.push("Dirección completa");
+
+  return { missingPhase1, missingPhase2 };
+}
+function verificarSiElMensajeEsSoloNombre(userMessage) {
+  const cleanMessage = userMessage.trim();
+  let detectedName = null;
+  const isLikelyName =
+    cleanMessage.length <= 40 &&
+    /^[a-záéíóúüñ\s]+$/i.test(cleanMessage) &&
+    !/(hola|buenos|buenas|gracias|cita|precio|servicio|quiero|necesito|agenda|visita)/i.test(cleanMessage);
+
+  if (isLikelyName) {
+    detectedName = cleanMessage;
+  }
+  const normalizeName = (name) =>
+    name
+      .toLowerCase()
+      .replace(/\b\w/g, (l) => l.toUpperCase());
+
+  if (detectedName) {
+    detectedName = normalizeName(detectedName);
+  }
+  return detectedName;
+}
+function revisarSiEsSolicitudDeReserva(userMessage) {
+
+  // 🔥 QUIERE QUE VAYAN (ALTA INTENCIÓN)
+  const intentVisit =
+    /(puedes venir|pueden venir|puedes pasar|pueden pasar|manda a alguien|manden a alguien|envía tecnico|envien tecnico|quiero que vengan|necesito que vengan)/i
+      .test(userMessage);
+
+  // 🔥 YA HABLA DE AGENDAR
+  const intentSchedule =
+    /(agendar|agenda|agendamos|agéndalo|cita|programar|reservar|apartar|qué día|qué hora|horario disponible)/i
+      .test(userMessage);
+
+  // 🔥 TIENE PROBLEMA (PERO NO NECESARIAMENTE AGENDA)
+  const intentProblem =
+    /(reparar|reparación|arreglar|falla|problema|no sirve|descompuesto|checar|revisar|diagnosticar)/i
+      .test(userMessage);
+
+  // =========================
+  // 🧠 CLASIFICACIÓN
+  // =========================
+
+  // 🟢 INTENCIÓN FUERTE → ir directo a flujo
+  if (intentVisit || intentSchedule) {
+    return 'hard';
+  }
+
+  // 🟡 INTENCIÓN SUAVE → guiar primero
+  if (intentProblem) {
+    return 'soft';
+  }
+
+  return 'none';
+}
 
 /**
  * Analiza el mensaje de un usuario y devuelve:
@@ -229,13 +443,13 @@ Mensaje:
     try {
       // Limpiar backticks y markdown si OpenAI retorna el JSON así
       text = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-      
+
       // Intentar extraer JSON si está dentro de texto
       const jsonMatch = text.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         text = jsonMatch[0];
       }
-      
+
       return JSON.parse(text);
     } catch (parseError) {
       console.warn('⚠️ No se pudo parsear análisis:', text);
@@ -257,7 +471,8 @@ export async function generateContextualResponse({
   userMessage,
   conversationHistory = [],
   systemPrompt,
-  analysis
+  analysis,
+  dateTime
 }) {
   try {
     const openai = getOpenAIInstance();
@@ -330,6 +545,17 @@ El cliente no tiene urgencia:
 
     const finalPrompt = `
 ${systemPrompt}
+🕒 CONTEXTO DE TIEMPO:
+- Fecha actual: ${dateTime?.date}
+- Hora actual: ${dateTime?.time}
+- Hora numérica: ${dateTime?.hour}
+Reglas para agendar:
+- Horario disponible: 9:00 a 19:00
+- Las citas son en bloques de 1 hora (ej: 10:00, 11:00)
+- Si ya es tarde (después de las 18:00), sugiere el día siguiente
+- Si el cliente tiene urgencia alta, sugiere el horario más cercano disponible
+- Si es temprano, puedes sugerir "hoy"
+- Nunca sugieras horas pasadas
 
 📊 ANÁLISIS DEL CLIENTE:
 - Intención: ${analysis.intencion}
@@ -354,8 +580,8 @@ Responde como asesor de ventas experto.
     // Filtrar y mapear conversationHistory para asegurar que content sea string
     const safeHistory = Array.isArray(conversationHistory)
       ? conversationHistory
-          .filter(msg => msg && typeof msg.content === 'string')
-          .map(msg => ({ ...msg, content: String(msg.content) }))
+        .filter(msg => msg && typeof msg.content === 'string')
+        .map(msg => ({ ...msg, content: String(msg.content) }))
       : [];
 
     const completion = await openai.chat.completions.create({
@@ -484,7 +710,50 @@ CONVERSIÓN DE HORARIOS:
     return { shouldReserve: false };
   }
 }
+export async function generateNotesWithAI(conversationHistory) {
+  try {
+    const formattedHistory = conversationHistory
+      .slice(-10) // 🔥 optimización
+      .map(m => `${m.role === 'user' ? 'Cliente' : 'Asistente'}: ${m.content}`)
+      .join('\n');
 
+    const prompt = `
+Analiza la conversación y genera un resumen en UNA SOLA LÍNEA.
+
+Formato:
+Cliente - servicio - problema - ubicación - urgencia
+
+Ejemplo:
+Juan Pérez - reparación de ventana - filtración de agua - Roma Norte CDMX - media
+
+Reglas:
+- Máximo 15 palabras
+- Sin saltos de línea
+- Sin etiquetas
+- No inventes información
+
+Conversación:
+${formattedHistory}
+`;
+
+    const response = await openai.chat.completions.create({
+      model: "gpt-4.1-mini",
+      messages: [
+        { role: "system", content: "Resumes conversaciones de forma ultra breve." },
+        { role: "user", content: prompt }
+      ],
+      temperature: 0.2,
+    });
+
+    let text = response.choices[0].message.content || '';
+
+    // 🔥 asegurar una sola línea SIEMPRE
+    return text.replace(/\n/g, ' ').slice(0, 120).trim();
+  } catch (error) {
+    console.error('❌ Error generando notes:', error);
+    return '';
+  }
+}
 /**
  * ============================
  * 🔐 VALIDAR Y FORMATEAR DATOS
@@ -494,7 +763,7 @@ CONVERSIÓN DE HORARIOS:
 export function validateAndFormatReservationData(data, existingAppointments = []) {
   try {
     console.log('🔐 Iniciando validación de datos de reservación:', data);
-    
+
     // ✅ 1. Validar que sea Ciudad de México
     console.log('🌍 Verificando localización...');
     if (!data.city) {
@@ -505,12 +774,12 @@ export function validateAndFormatReservationData(data, existingAppointments = []
         missingData: ['Ciudad']
       };
     }
-    
+
     const cityNormalized = data.city.toLowerCase().trim();
-    const isValidCity = cityNormalized.includes('cdmx') || 
-                        cityNormalized.includes('ciudad de méxico') || 
-                        cityNormalized.includes('mexico city');
-    
+    const isValidCity = cityNormalized.includes('cdmx') ||
+      cityNormalized.includes('ciudad de méxico') ||
+      cityNormalized.includes('mexico city');
+
     if (!isValidCity) {
       console.warn(`❌ Ciudad no permitida: ${data.city}`);
       return {
@@ -519,7 +788,7 @@ export function validateAndFormatReservationData(data, existingAppointments = []
       };
     }
     console.log('✅ Ciudad validada: CDMX ✓');
-    
+
     // ✅ 2. Validar nombre del cliente
     console.log('👤 Validando nombre...');
     if (!data.clientName || data.clientName.trim().length === 0) {
@@ -531,7 +800,7 @@ export function validateAndFormatReservationData(data, existingAppointments = []
       };
     }
     console.log('✅ Nombre validado:', data.clientName);
-    
+
     // ✅ 3. Validar tipo de servicio
     console.log('🔧 Validando tipo de servicio...');
     if (!data.serviceType || data.serviceType.trim().length === 0) {
@@ -543,7 +812,7 @@ export function validateAndFormatReservationData(data, existingAppointments = []
       };
     }
     console.log('✅ Servicio validado:', data.serviceType);
-    
+
     // ✅ 4. Validar dirección (CRÍTICA - debe ser específica)
     console.log('🏠 Validando dirección...');
     if (!data.address || data.address.trim().length < 5) {
@@ -554,11 +823,42 @@ export function validateAndFormatReservationData(data, existingAppointments = []
         missingData: ['Dirección específica']
       };
     }
-    
+    // 📝 Validar notes (OPCIONAL)
+    console.log('📝 Validando notes...');
+
+    let notes = '';
+
+    if (typeof data.notes === 'string') {
+      notes = data.notes
+        .replace(/\s+/g, ' ')   // limpia espacios y saltos
+        .trim()
+        .slice(0, 150);        // límite duro
+    }
+
+    // 🔥 FILTROS DE CALIDAD
+    if (notes.length < 10) {
+      notes = '';
+    }
+
+    // ❌ frases basura
+    const genericPhrases = [
+      'sin información',
+      'no especificado',
+      'no disponible',
+      'cliente solicita información',
+      'n/a'
+    ];
+
+    if (genericPhrases.some(p => notes.toLowerCase().includes(p))) {
+      notes = '';
+    }
+
+    // ✅ asignación final segura
+    data.notes = notes;
     // Detectar direcciones vagas
     const vaguePhrases = ['en mi casa', 'en el trabajo', 'en casa', 'aqui', 'ahi', 'en el local', 'en mi lugar'];
     const addressLower = data.address.toLowerCase().trim();
-    
+
     if (vaguePhrases.some(phrase => addressLower.includes(phrase)) || addressLower.split(' ').length < 3) {
       console.warn('⚠️ Dirección muy vaga:', data.address);
       return {
@@ -567,9 +867,9 @@ export function validateAndFormatReservationData(data, existingAppointments = []
         missingData: ['Dirección específica con calle, número, colonia y delegación']
       };
     }
-    
+
     console.log('✅ Dirección validada:', data.address);
-    
+
     // ✅ 5. Validar que la fecha y hora estén disponibles
     console.log('📅 Validando fecha y hora...');
     if (!data.preferredDate || !data.preferredTime) {
@@ -583,50 +883,50 @@ export function validateAndFormatReservationData(data, existingAppointments = []
         ].filter(x => x)
       };
     }
-    
+
     // ✅ 6. Parsear y validar fecha y hora
     let dateTime = null;
     try {
       console.log(`📅 Parseando fecha: ${data.preferredDate} y hora: ${data.preferredTime}`);
-      
+
       // ⚠️ IMPORTANTE: Parsear la fecha en zona horaria LOCAL, no en UTC
       const [year, month, day] = data.preferredDate.split('-');
       const date = new Date(parseInt(year), parseInt(month) - 1, parseInt(day));
-      
+
       // Validar que la fecha sea válida
       if (isNaN(date.getTime())) {
         throw new Error('Formato de fecha inválido. Debe ser YYYY-MM-DD');
       }
-      
+
       const [hours, minutes] = data.preferredTime.split(':');
       const parsedHours = parseInt(hours);
       const parsedMinutes = parseInt(minutes);
-      
+
       console.log(`⏰ Horas: ${parsedHours}, Minutos: ${parsedMinutes}`);
-      
+
       // ✅ NUEVA VALIDACIÓN: Solo bloques de 1 hora (minutos = 00)
       if (parsedMinutes !== 0) {
         console.warn('⚠️ Minutos no son 00:', parsedMinutes);
         throw new Error(`Las citas deben ser en bloques de 1 hora exacta (9:00, 10:00, etc.). No se permiten horarios como ${parsedHours}:${String(parsedMinutes).padStart(2, '0')}`);
       }
-      
+
       // ✅ NUEVA VALIDACIÓN: Horario de atención 9 AM a 7 PM
       if (parsedHours < 9 || parsedHours > 19) {
         console.warn('⚠️ Hora fuera del horario de atención:', parsedHours);
         const availableHours = '9:00, 10:00, 11:00, 12:00, 13:00, 14:00, 15:00, 16:00, 17:00, 18:00, 19:00';
         throw new Error(`El horario de atención es de 9:00 AM a 7:00 PM. Horarios disponibles: ${availableHours}`);
       }
-      
+
       // Validar horas y minutos
       if (isNaN(parsedHours) || isNaN(parsedMinutes) || parsedHours < 0 || parsedHours > 23 || parsedMinutes < 0 || parsedMinutes > 59) {
         throw new Error('Hora inválida: debe ser HH:mm en formato 24 horas (ej: 14:00)');
       }
-      
+
       date.setHours(parsedHours, parsedMinutes, 0, 0);
       dateTime = date;
-      
+
       console.log(`✅ Fecha/hora parseada correctamente: ${dateTime.toISOString()}`);
-      
+
       // Validar que la fecha no esté en el pasado (normalizando a minutos exactos)
       const now = new Date();
       const nowNormalized = new Date(now.getFullYear(), now.getMonth(), now.getDate(), now.getHours(), now.getMinutes(), 0, 0);
@@ -673,7 +973,7 @@ export function validateAndFormatReservationData(data, existingAppointments = []
           suggestedDateTime: suggestedDateTime.toISOString(),
         };
       }
-      
+
     } catch (error) {
       console.error('❌ Error parseando fecha/hora:', error);
       return {
@@ -687,48 +987,48 @@ export function validateAndFormatReservationData(data, existingAppointments = []
     if (existingAppointments && existingAppointments.length > 0) {
       const BUFFER = 60 * 60 * 1000; // 1 hora de buffer
       const requestedTime = dateTime.getTime();
-      
+
       const conflictingAppointment = existingAppointments.find(appt => {
         const existingTime = new Date(appt.dateTime).getTime();
         const timeDifference = Math.abs(existingTime - requestedTime);
         return timeDifference < BUFFER;
       });
-      
+
       if (conflictingAppointment) {
         console.warn('❌ Horario ocupado:', {
           solicitado: dateTime.toLocaleString('es-MX'),
           existente: new Date(conflictingAppointment.dateTime).toLocaleString('es-MX')
         });
-        
+
         // Sugerir próximo horario disponible (solo bloques válidos entre 9-19)
         let suggestedTime = new Date(dateTime);
         let found = false;
-        
+
         for (let i = 1; i <= 10; i++) {
           suggestedTime.setHours(suggestedTime.getHours() + 1);
-          
+
           // Solo considerar si está dentro del horario 9-19
           if (suggestedTime.getHours() < 9 || suggestedTime.getHours() > 19) {
             continue;
           }
-          
+
           const suggestedTimeMs = suggestedTime.getTime();
-          
+
           const isAvailable = !existingAppointments.some(appt => {
             const existingTime = new Date(appt.dateTime).getTime();
             return Math.abs(existingTime - suggestedTimeMs) < BUFFER;
           });
-          
+
           if (isAvailable) {
             found = true;
             break;
           }
         }
-        
-        const suggestedTimeStr = found 
+
+        const suggestedTimeStr = found
           ? suggestedTime.toLocaleString('es-MX', { dateStyle: 'medium', timeStyle: 'short' })
           : 'próximamente';
-        
+
         return {
           valid: false,
           error: `⚠️ Ese horario ya está ocupado.\n\nTe propongo: ${suggestedTimeStr}\n\n¿Te funciona ese horario?`,
@@ -736,7 +1036,7 @@ export function validateAndFormatReservationData(data, existingAppointments = []
           suggestedDateTime: found ? suggestedTime.toISOString() : null
         };
       }
-      
+
       console.log('✅ Horario disponible ✓');
     }
 
