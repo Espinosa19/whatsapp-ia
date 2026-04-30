@@ -1,3 +1,4 @@
+
 import { generateAIResponse } from '../services/ai.service.js';
 import { validateAndFormatReservationData,generateNotesWithAI } from '../services/ai.service.js';
 import { createReservation, getUserReservations } from '../services/reservation.service.js';
@@ -8,7 +9,6 @@ import {
   clearConversationHistory
 } from '../services/conversation.service.js';
 import { getRedisClient } from '../config/redis.config.js';
-
 import { saveMessageToDB } from '../services/database.service.js';
 import { saveLead } from '../services/leads.service.js';
 import { logError, logSuccess, logInfo, logConversation, logWarning } from '../services/logger.service.js';
@@ -16,7 +16,6 @@ import { logError, logSuccess, logInfo, logConversation, logWarning } from '../s
 export const chatWithAI = async (req, res) => {
   const { message, history, userId } = req.body;
   const userIdentifier = userId || 'postman-user-default';
- 
   if (!message) {
     logWarning('Mensaje vacío recibido', 'chatWithAI');
     return res.status(400).json({ error: 'Mensaje requerido' });
@@ -50,16 +49,16 @@ export const chatWithAI = async (req, res) => {
       const savedHistory = await getConversationHistory(userIdentifier);
       conversationHistory = formatHistoryForOpenAI(savedHistory);
     }
+    
     let aiResponse;
 
     // 🤖 Generar respuesta
     logInfo(`Generando respuesta para ${userIdentifier}`, 'chatWithAI');
     try {
-
       aiResponse = await generateAIResponse({
           userMessage: message,
           conversationHistory,
-          userId: userIdentifier
+          userId: userIdentifier,
         });
       await redis.del(fallasKey);
     } catch (error) {
@@ -301,7 +300,6 @@ export const chatWithAI = async (req, res) => {
     });
   }
 };
-
 // Endpoint para obtener historial
 export const getHistory = async (req, res) => {
   const { userId } = req.query;

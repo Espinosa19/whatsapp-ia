@@ -3,6 +3,9 @@ import path from 'path';
 import { getOpenAIInstance } from '../config/openai.config.js';
 import { getRedisClient } from '../config/redis.config.js';
 import { createGoogleCalendarEvent } from '../services/google-calendar.service.js';
+import { getGoogleCalendarInstance } from '../config/google-calendar.config.js';
+import { google } from 'googleapis';
+import e from 'cors';
 
 export async function generateAIResponse({ userMessage, conversationHistory = [], userId }) {
   try {
@@ -11,6 +14,9 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
 
     const analysis = await analyzeUserMessage(userMessage);
     const redis = await getRedisClient();
+    if (!redis) {
+      console.error('❌ [AI] Redis no disponible');
+    }
     // =========================
     // 🔑 REDIS KEYS
     // =========================
@@ -19,26 +25,34 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
     const addressKey = userId ? `address:${userId}` : null;
     const pendingReservationKey = userId ? `pendingReservation:${userId}` : null;
     const phaseKey = `reservationPhase:${userId}`;
+    const session = await getSessionRedis(redis, userId);
+    const preferedDateKey = userId ? `preferedDate:${userId}` : null;
+    const preferedTimeKey = userId ? `preferedTime:${userId}` : null;
     // =========================
     // 🧠 EXTRACCIÓN SIMPLE
     // =========================
+    // Limpieza de saludos y frases comunes para mejorar extracción
     let lowerUserMessage = userMessage.toLowerCase();
-    const messageCount = conversationHistory.length;
+    let cleanMessage = userMessage
+      .replace(/^(hola|buenos días|buenas tardes|buenas noches|hey|buen día|saludos)[,!.\s]*/i, '')
+      .replace(/[,!.]$/g, '')
+      .trim();
     let detectedName = null;
-    if (messageCount <= 2) {
-      const lowerUserMessage = userMessage.toLowerCase();
-
-      const nameMatch = lowerUserMessage.match(
-        /\b(mi nombre es|me llamo|soy|yo soy|me dicen|puedes llamarme|soy el|soy la)\b\s*([a-záéíóúüñ\s]{2,40})/i
+    let clientName = await redis.get(clientNameKey);
+    if (!clientName) {
+      const nameMatch = cleanMessage.match(
+        /\b(mi nombre es|me llamo|soy|yo soy|me dicen|puedes llamarme|soy el|soy la)\b[\s,:-]*([a-záéíóúüñ.'\-\s]{2,60})/i
       );
 
       if (nameMatch) {
-        detectedName = nameMatch[2].trim();
+        let rawName = nameMatch[2].replace(/[,!.].*$/, '').trim();
+        let nameParts = rawName.split(' ').filter(Boolean);
+        detectedName = nameParts.slice(0, 3).join(' ');
       } else {
-        // 🔥 caso: solo mandan nombre
-        detectedName = verificarSiElMensajeEsSoloNombre(userMessage);
+        detectedName = verificarSiElMensajeEsSoloNombre(cleanMessage);
       }
     }
+
     const emailMatch = userMessage.match(/([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)/);
 
     // 🔥 MEJOR DETECCIÓN DE DIRECCIÓN
@@ -57,18 +71,33 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
         /(calle|avenida|av\.?|colonia|col\.?|cp|c\.p\.?|número|numero|interior|int|mz|lote)/i
           .test(userMessage);
 
-      if (looksLikeAddress && userMessage.length > 10) {
+      const hasNumber = /\d+/.test(userMessage); // dirección casi siempre tiene número
+
+      const looksLikeNonAddress =
+    /(visita|cita|agendar|agenda|día|hora|mañana|tarde|perfecto|ok|gracias)/i
+      .test(userMessage);
+
+      if (
+        looksLikeAddress &&
+        hasNumber &&
+        !looksLikeNonAddress &&
+        userMessage.length > 10
+      ) {
         detectedAddress = userMessage.trim();
       }
     }
     const detectedEmail = emailMatch?.[1] || null;
-    const clientName = clientNameKey ? await redis.get(clientNameKey) : null;
 
     // =========================
     // 💾 GUARDAR EN REDIS
     // =========================
     if (!clientName && detectedName) {
       await redis.setEx(clientNameKey, 3600, detectedName);
+      clientName = detectedName; // 🔥 FIX CLAVE
+
+      // 🔥 marcar inicio de sesión
+      session.hasStarted = true;
+      await saveSessionRedis(redis, userId, session);
     }
 
     if (clientEmailKey && detectedEmail) {
@@ -78,58 +107,107 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
     if (addressKey && detectedAddress) {
       await redis.setEx(addressKey, 3600, detectedAddress);
     }
+    // 🛑 CONTROL DE ONBOARDING
+       if (!clientName && !session.hasStarted) {
+      session.hasStarted = true;
+      await saveSessionRedis(redis, userId, session);
 
+      return {
+        reply: `Hola 👋, te atiende Gerardo de Constructumex.  
+¿Con quién tengo el gusto?`,
+        reservationRequest: false,
+        reservationData: null
+      };
+    }
     // =========================
     // 🔄 RECUPERAR
     // =========================
     const clientEmail = clientEmailKey ? await redis.get(clientEmailKey) : null;
     let phase = await redis.get(phaseKey);
     // default
-    if (!phase) phase = 'phase1';
+    if (!phase) {
+      phase = 'phase1';
+    }
     const address = addressKey ? await redis.get(addressKey) : null;
+    const preferedDate = preferedDateKey ? await redis.get(preferedDateKey) : null;
+    const preferedTime = preferedTimeKey ? await redis.get(preferedTimeKey) : null;
     const confirmAppointment =
       /\b(si|sí|ok|vale|va|dale|perfecto|me parece|claro|por favor|hazlo|agendalo|agéndalo)\b.*\b(cita|visita|agendar|agenda|programar|ir)\b/i
-        .test(userMessage);
+        .test(lowerUserMessage);
+    const simpleConfirmation =
+      /^(si|sí|ok|vale|va|dale|perfecto|me parece|claro|por favor|hazlo|agendalo|agéndalo)$/i
+        .test(lowerUserMessage.trim());
     const negativeSoft =
       /(precio|cotización|información|info|solo estoy viendo|comparando|quiero saber)/i
-        .test(userMessage);
-    const intentType = revisarSiEsSolicitudDeReserva(userMessage);
+        .test(lowerUserMessage);
+    const intentType = revisarSiEsSolicitudDeReserva(lowerUserMessage);
     let reservationData = null;
 
     if (intentType === 'soft' && negativeSoft) {
+      session.awaitingAppointmentConfirmation = true;
+      session.inReservationFlow = false;
+      await saveSessionRedis(redis, userId, session);
       return {
         reply: `Entiendo que estás buscando información. ¿Quieres que te ayude a agendar una visita técnica para revisar tu caso?`,
         reservationRequest: false,
         reservationData: null
       };
     }
+    const revisarConfirmacion =
+      session.awaitingAppointmentConfirmation &&
+      (simpleConfirmation || confirmAppointment);
     // =========================
     // 🧠 FLUJO DE RESERVACIÓN
     // =========================
-    if ((intentType === 'hard' && !negativeSoft) || (confirmAppointment && !negativeSoft)) {
+    if (
+      (!negativeSoft) &&
+      (
+        intentType === 'hard' ||
+        revisarConfirmacion ||
+        session.inReservationFlow
+      )
+    ) {
       reservationData = await detectAndExtractReservationData(userMessage, conversationHistory);
       reservationData = {
         ...reservationData,
         clientName: clientName || reservationData.clientName,
         clientEmail: clientEmail || reservationData.clientEmail,
         address: address || reservationData.address,
+        preferredDate: preferedDate || reservationData.preferredDate,
+        preferredTime: preferedTime || reservationData.preferredTime
       };
+      const suggestedSlots = session.suggestedSlots || [];
+      const selectedSlot = getSelectedSlotByIndex(userMessage, suggestedSlots);
+      if (selectedSlot) {
+        const date = new Date(selectedSlot.iso);
+        reservationData.preferredDate = date.toISOString().split('T')[0];
+        reservationData.preferredTime = date.toISOString().split('T')[1].slice(0,5);
+        await redis.setEx(preferedDateKey, 3600, reservationData.preferredDate);
+        await redis.setEx(preferedTimeKey, 3600, reservationData.preferredTime);
+        await redis.setEx(phaseKey, 900, 'phase2');
+        // 🔥 avanzar flujo
+      }
+      if (revisarConfirmacion) {
+        session.awaitingAppointmentConfirmation = false;
+        session.inReservationFlow = true;
+        await saveSessionRedis(redis, userId, session);
+      }
       const { missingPhase1, missingPhase2 } = buildMissing(reservationData);
-
       if (
         missingPhase1.length === 0 &&
         missingPhase2.length === 0 &&
         reservationData.shouldReserve
       ) {
+        session.inReservationFlow = false;
+        session.awaitingAppointmentConfirmation = false;
+        await saveSessionRedis(redis, userId, session);
         await redis.del(phaseKey);
-
         return {
           reply: `Perfecto 👍 ya tengo todos los datos para agendar tu visita.`,
           reservationRequest: true,
           reservationData
         };
       }
-
       if (reservationData && typeof reservationData === 'object') {
         await redis.setEx(
           pendingReservationKey,
@@ -202,6 +280,10 @@ Por ejemplo: "mañana a las 5pm" o "el viernes por la mañana`,
     // =========================
     const pendingStr = await redis.get(pendingReservationKey);
 
+    if (!pendingStr) {
+      session.inReservationFlow = false;
+      await saveSessionRedis(redis, userId, session);
+    }
     if (pendingStr) {
       let pending = JSON.parse(pendingStr);
 
@@ -213,6 +295,8 @@ Por ejemplo: "mañana a las 5pm" o "el viernes por la mañana`,
         clientName: detectedName || clientName || pending.clientName,
         address: detectedAddress || address || pending.address,
         clientEmail: detectedEmail || clientEmail || pending.clientEmail,
+        preferredDate: preferedDate || pending.preferredDate,
+        preferredTime: preferedTime || pending.preferredTime
       };
       const { missingPhase1, missingPhase2 } = buildMissing(reservationData);
       if (missingPhase1.length === 0 &&
@@ -306,21 +390,182 @@ Por ejemplo: "mañana a las 5pm" o "el viernes por la mañana`,
       }),
       timestamp: now.getTime()
     };
+    const busySlots = await getBusyTimes(); // 🔥 de Google Calendar
+    const suggestedDates = await getMultipleSuggestedDates(busySlots, {
+      limit: 3
+    });
+    const suggestedText = formatMultipleSuggestedDates(suggestedDates);
+
     // =========================
     // 🤖 RESPUESTA NORMAL
     // =========================
-    return await generateContextualResponse({
+    const aiResponse = await generateContextualResponse({
       userMessage,
       conversationHistory,
       systemPrompt,
       analysis,
-      dateTime
+      dateTime,
+      suggestedText
     });
-
+    console.log('🧠 aiResponse:', aiResponse);
+console.log('🧠 tipo:', typeof aiResponse);
+    const suggestsAppointment =
+      /\b(agendar|agenda|visita|cita|programar)\b/i.test(aiResponse);
+    if (suggestsAppointment && !reservationData) {
+      session.awaitingAppointmentConfirmation = true;
+      session.suggestedSlots  = suggestedDates.map((d, i) => ({
+        index: i + 1,
+        iso: d.toISOString()
+      }));
+      await saveSessionRedis(redis, userId, session);
+    }
+    return {
+      reply: aiResponse,
+      reservationRequest: false,
+      reservationData: null
+    };
   } catch (error) {
     console.error('❌ Error IA:', error);
     return { reply: 'Ocurrió un error. Intenta nuevamente.' };
   }
+}
+function getSelectedSlotByIndex(userMessage, suggestedSlots) {
+  const match = userMessage.match(/\b(\d{1,2})\b/);
+
+  if (!match) return null;
+
+  const index = parseInt(match[1], 10);
+
+  return suggestedSlots.find(slot => slot.index === index) || null;
+}
+ async function getSessionRedis(redis, userId) {
+  const sessionKey = `session:${userId}`;
+  const sessionStr = await redis.get(sessionKey);
+
+  if (!sessionStr) {
+    return {
+      awaitingAppointmentConfirmation: false,
+      suggestedSlots : [],
+      inReservationFlow : false,
+      hasStarted: false,
+      lastBotMessage: null
+    };
+  }
+
+  return JSON.parse(sessionStr);
+}
+
+async function saveSessionRedis(redis, userId, session) {
+  const sessionKey = `session:${userId}`;
+
+  await redis.setEx(
+    sessionKey,
+    3600, // 1 hora TTL
+    JSON.stringify(session)
+  );
+}
+async function getBusyTimes(auth) {
+  const calendar = await getGoogleCalendarInstance();
+  if (!calendar) throw new Error('Calendar no inicializado');
+
+  const response = await calendar.freebusy.query({
+    auth,
+    requestBody: {
+      timeMin: new Date().toISOString(),
+      timeMax: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(), // 7 días
+      items: [{ id: 'primary' }]
+    }
+  });
+
+  return response.data.calendars.primary.busy;
+}
+async function getMultipleSuggestedDates(
+  busySlots,
+  {
+    limit = 3,          // cuántas opciones quieres devolver
+    searchHours = 72,   // cuántas horas hacia adelante buscar
+    startOffsetHours = 4, // empezar en +4h desde ahora
+    workStart = 9,
+    workEnd = 19,
+    slotMinutes = 60
+  } = {}
+) {
+  const now = new Date();
+
+  // 🔥 punto inicial (+4 horas)
+  let date = new Date(now);
+  date.setHours(date.getHours() + startOffsetHours);
+
+  // 🔥 redondear a siguiente bloque exacto
+  if (date.getMinutes() > 0) {
+    date.setHours(date.getHours() + 1);
+    date.setMinutes(0, 0, 0);
+  } else {
+    date.setSeconds(0, 0);
+  }
+
+  const suggestions = [];
+
+  for (let i = 0; i < searchHours; i++) {
+
+    const hour = date.getHours();
+
+    // ✅ dentro de horario laboral
+    if (hour >= workStart && hour <= workEnd) {
+
+      if (isSlotAvailable(date, busySlots, slotMinutes)) {
+        suggestions.push(new Date(date)); // ⚠️ clonar fecha
+
+        if (suggestions.length >= limit) {
+          break; // 🔥 ya tenemos suficientes
+        }
+      }
+    }
+
+    // 👉 siguiente bloque
+    date.setMinutes(date.getMinutes() + slotMinutes);
+
+    // 👉 si se pasa del horario → siguiente día a las 9
+    if (date.getHours() > workEnd) {
+      date.setDate(date.getDate() + 1);
+      date.setHours(workStart, 0, 0, 0);
+    }
+  }
+
+  return suggestions; // 👈 ARRAY de fechas
+}function formatMultipleSuggestedDates(dates) {
+  return dates
+    .map((date, i) => {
+      const label = i === 0
+        ? 'Primera opción'
+        : i === 1
+        ? 'Otra opción'
+        : 'También disponible';
+
+      return `${i + 1}. ${label}: ${formatSuggestedDate(date)}`;
+    })
+    .join('\n');
+}
+function formatSuggestedDate(date) {
+  return date.toLocaleString('es-MX', {
+    weekday: 'long',
+    day: 'numeric',
+    month: 'long',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true
+  });
+}
+function isSlotAvailable(date, busySlots, durationMinutes = 60) {
+  const start = date.getTime();
+  const end = start + durationMinutes * 60 * 1000;
+
+  return !busySlots.some(slot => {
+    const busyStart = new Date(slot.start).getTime();
+    const busyEnd = new Date(slot.end).getTime();
+
+    return start < busyEnd && end > busyStart;
+  });
 }
 function buildMissing(reservationData) {
   const missingPhase1 = [];
@@ -335,23 +580,23 @@ function buildMissing(reservationData) {
   return { missingPhase1, missingPhase2 };
 }
 function verificarSiElMensajeEsSoloNombre(userMessage) {
-  const cleanMessage = userMessage.trim();
+  const clean = userMessage.trim()
+    .replace(/[,!.]$/g, '')
+    .replace(/\s{2,}/g, ' ');
   let detectedName = null;
+  // Permitir nombres de hasta 60 caracteres, con letras, espacios, puntos y guiones
   const isLikelyName =
-    cleanMessage.length <= 40 &&
-    /^[a-záéíóúüñ\s]+$/i.test(cleanMessage) &&
-    !/(hola|buenos|buenas|gracias|cita|precio|servicio|quiero|necesito|agenda|visita)/i.test(cleanMessage);
+    clean.length >= 2 &&
+    clean.length <= 60 &&
+    /^[a-záéíóúüñ.'\-\s]+$/i.test(clean) &&
+    !/(hola|buenos|buenas|gracias|cita|precio|servicio|quiero|necesito|agenda|visita|problema|cotización|información|info|solo estoy viendo|comparando|quiero saber)/i.test(clean);
 
   if (isLikelyName) {
-    detectedName = cleanMessage;
-  }
-  const normalizeName = (name) =>
-    name
-      .toLowerCase()
-      .replace(/\b\w/g, (l) => l.toUpperCase());
-
-  if (detectedName) {
-    detectedName = normalizeName(detectedName);
+    // Si el nombre tiene más de 3 palabras, tomar solo las primeras 3
+    let nameParts = clean.split(' ').filter(Boolean);
+    detectedName = nameParts.slice(0, 3).join(' ');
+    // Normalizar mayúsculas
+    detectedName = detectedName.toLowerCase().replace(/\b\w/g, (l) => l.toUpperCase());
   }
   return detectedName;
 }
@@ -472,7 +717,8 @@ export async function generateContextualResponse({
   conversationHistory = [],
   systemPrompt,
   analysis,
-  dateTime
+  dateTime,
+  suggestedText
 }) {
   try {
     const openai = getOpenAIInstance();
@@ -549,6 +795,20 @@ ${systemPrompt}
 - Fecha actual: ${dateTime?.date}
 - Hora actual: ${dateTime?.time}
 - Hora numérica: ${dateTime?.hour}
+📅 HORARIO SUGERIDO:
+Puedes proponer al cliente los siguientes horarios disponibles:
+
+${suggestedText}
+
+Instrucciones:
+- Presenta los horarios como opciones claras
+- Pide al cliente que elija una (puede responder con el número o la hora)
+- Si ninguno le funciona, invítalo a proponer otro día u horario
+- Mantén el mensaje natural y conversacional
+
+Restricciones:
+- No inventes horarios adicionales
+- No modifiques los horarios proporcionados
 Reglas para agendar:
 - Horario disponible: 9:00 a 19:00
 - Las citas son en bloques de 1 hora (ej: 10:00, 11:00)
@@ -1164,3 +1424,4 @@ export async function processReservation(userMessage, history, existingAppointme
     message: `✅ ¡Cita confirmada!\n\n📅 ${new Date(appointment.dateTime).toLocaleString('es-MX')}\n📍 ${appointment.address}\n\n¡Te esperamos! 🛠️`
   };
 }
+
