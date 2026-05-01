@@ -1,6 +1,7 @@
 // src/services/google-calendar.service.js
 // Mock básico para evitar error de importación y permitir pruebas del flujo.
 // Reemplaza este mock por la integración real con Google Calendar cuando lo requieras.
+import { getGoogleCalendarInstance } from '../config/google-calendar.config.js';
 
 /**
  * Crea un evento en Google Calendar (mock).
@@ -33,4 +34,28 @@ export async function createGoogleCalendarEvent(reservationData) {
       clientPhone: reservationData.clientPhone
     }
   };
+}
+export async function getBusyTimes() {
+  const calendar = await getGoogleCalendarInstance();
+
+  if (!calendar) {
+    throw new Error('Calendar no inicializado');
+  }
+
+  const response = await calendar.freebusy.query({
+    requestBody: {
+      timeMin: new Date().toISOString(),
+      timeMax: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+      timeZone: 'America/Mexico_City', // 🔥 IMPORTANTE
+      items: [{ id: process.env.GOOGLE_CALENDAR_ID }]
+    }
+  });
+const calendarData = response.data.calendars?.[process.env.GOOGLE_CALENDAR_ID];
+
+if (!calendarData) {
+  console.warn('⚠️ No se encontró el calendario en la respuesta');
+  return [];
+}
+
+return calendarData.busy || [];
 }

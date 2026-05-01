@@ -2,9 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { getOpenAIInstance } from '../config/openai.config.js';
 import { getRedisClient } from '../config/redis.config.js';
-import { createGoogleCalendarEvent } from '../services/google-calendar.service.js';
-import { getGoogleCalendarInstance } from '../config/google-calendar.config.js';
-import { google } from 'googleapis';
+import { createGoogleCalendarEvent,getBusyTimes } from '../services/google-calendar.service.js';
 import e from 'cors';
 
 export async function generateAIResponse({ userMessage, conversationHistory = [], userId }) {
@@ -28,6 +26,7 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
     const session = await getSessionRedis(redis, userId);
     const preferedDateKey = userId ? `preferedDate:${userId}` : null;
     const preferedTimeKey = userId ? `preferedTime:${userId}` : null;
+    const serviceTypeKey = userId ? `serviceType:${userId}` : null;
     // =========================
     // 🧠 EXTRACCIÓN SIMPLE
     // =========================
@@ -57,7 +56,7 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
 
     // 🔥 MEJOR DETECCIÓN DE DIRECCIÓN
     let detectedAddress = null;
-
+    
     // Caso con frase clara
     const addressMatch = userMessage.match(
       /(mi dirección es|vivo en|estoy en|me ubico en|queda en|ubicado en)\s+(.+)/i
@@ -66,23 +65,13 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
     if (addressMatch) {
       detectedAddress = addressMatch[2].trim();
     } else {
-      // 🔥 fallback: detectar si parece dirección
-      const looksLikeAddress =
-        /(calle|avenida|av\.?|colonia|col\.?|cp|c\.p\.?|número|numero|interior|int|mz|lote)/i
-          .test(userMessage);
-
-      const hasNumber = /\d+/.test(userMessage); // dirección casi siempre tiene número
-
-      const looksLikeNonAddress =
-    /(visita|cita|agendar|agenda|día|hora|mañana|tarde|perfecto|ok|gracias)/i
-      .test(userMessage);
-
-      if (
-        looksLikeAddress &&
-        hasNumber &&
-        !looksLikeNonAddress &&
-        userMessage.length > 10
-      ) {
+      // Nueva heurística: solo aceptar si hay palabra clave de dirección Y número
+      const hasNumber = /\d+/.test(userMessage);
+      const hasStreetWords = /(calle|avenida|av\.?|colonia|col\.?|cp|c\.p\.?|número|numero|interior|int|mz|lote)/i.test(userMessage);
+      const looksLikeNonAddress = /(visita|cita|agendar|agenda|día|hora|mañana|tarde|perfecto|ok|gracias|servicio|precio|cotización|información|info|solo estoy viendo|comparando|quiero saber|hola|buenos|buenas|gracias)/i.test(userMessage);
+      const isLongEnough = userMessage.length > 10;
+      // Solo aceptar si hay palabra de calle Y número, no solo número y palabras
+      if (hasStreetWords && hasNumber && !looksLikeNonAddress && isLongEnough) {
         detectedAddress = userMessage.trim();
       }
     }
@@ -105,7 +94,21 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
     }
 
     if (addressKey && detectedAddress) {
+      const isCDMX = isCDMXAddress(detectedAddress);
+
+      if (!isCDMX) {
+        return {
+          reply: `Para poder ayudarte mejor, por ahora solo trabajamos en Ciudad de México 📍  
+    ¿Tu proyecto se encuentra en CDMX?`,
+          reservationRequest: false,
+          reservationData: null
+        };
+      }
+
       await redis.setEx(addressKey, 3600, detectedAddress);
+    }
+    if (serviceTypeKey && analysis?.tipo_servicio) {
+      await redis.setEx(serviceTypeKey, 3600, analysis.tipo_servicio);
     }
     // 🛑 CONTROL DE ONBOARDING
        if (!clientName && !session.hasStarted) {
@@ -123,6 +126,7 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
     // 🔄 RECUPERAR
     // =========================
     const clientEmail = clientEmailKey ? await redis.get(clientEmailKey) : null;
+    const serviceType = serviceTypeKey ? await redis.get(serviceTypeKey) : null;
     let phase = await redis.get(phaseKey);
     // default
     if (!phase) {
@@ -143,7 +147,7 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
     const intentType = revisarSiEsSolicitudDeReserva(lowerUserMessage);
     let reservationData = null;
 
-    if (intentType === 'soft' && negativeSoft) {
+if (intentType === 'soft' && negativeSoft && !session.inReservationFlow) {
       session.awaitingAppointmentConfirmation = true;
       session.inReservationFlow = false;
       await saveSessionRedis(redis, userId, session);
@@ -164,6 +168,7 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
       (
         intentType === 'hard' ||
         revisarConfirmacion ||
+        session.awaitingAppointmentConfirmation ||
         session.inReservationFlow
       )
     ) {
@@ -173,11 +178,18 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
         clientName: clientName || reservationData.clientName,
         clientEmail: clientEmail || reservationData.clientEmail,
         address: address || reservationData.address,
+        serviceType: serviceType || analysis.tipo_servicio || reservationData.serviceType,
         preferredDate: preferedDate || reservationData.preferredDate,
         preferredTime: preferedTime || reservationData.preferredTime
       };
       const suggestedSlots = session.suggestedSlots || [];
-      const selectedSlot = getSelectedSlotByIndex(userMessage, suggestedSlots);
+      // Mejor lógica: si el usuario responde con número, o con texto que coincide razonablemente con un slot sugerido, tomar ese slot
+      let selectedSlot = getSelectedSlotByIndex(userMessage, suggestedSlots);
+      if (!selectedSlot) {
+        // Intentar match flexible por texto (ej: "hoy a las 6 de la tarde")
+          selectedSlot = matchUserToSlot(userMessage, suggestedSlots);
+
+      }
       if (selectedSlot) {
         const date = new Date(selectedSlot.iso);
         reservationData.preferredDate = date.toISOString().split('T')[0];
@@ -198,6 +210,55 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
         missingPhase2.length === 0 &&
         reservationData.shouldReserve
       ) {
+        // 🔒 Validación reforzada de disponibilidad
+        const busySlots = await getBusyTimes();
+        let slotDateTime = null;
+        try {
+          if (reservationData.preferredDate && reservationData.preferredTime) {
+            const [year, month, day] = reservationData.preferredDate.split('-');
+            const [hour, minute] = reservationData.preferredTime.split(':');
+            slotDateTime = new Date(
+              parseInt(year),
+              parseInt(month) - 1,
+              parseInt(day),
+              parseInt(hour),
+              parseInt(minute),
+              0, 0
+            );
+          }
+        } catch (e) {}
+        let slotOk = false;
+        if (slotDateTime) {
+          slotOk = isSlotAvailable(slotDateTime, busySlots, 60);
+        }
+        // 🔎 DEBUG: Mostrar reservationData antes de confirmar
+        console.log('[DEBUG][RESERVATION] reservationData final:', JSON.stringify(reservationData, null, 2));
+        if (!slotOk) {
+          // Buscar siguiente horario disponible
+          let nextSlot = new Date(slotDateTime);
+          let found = false;
+          for (let i = 1; i <= 10; i++) {
+            nextSlot.setHours(nextSlot.getHours() + 1);
+            if (nextSlot.getHours() < 9 || nextSlot.getHours() > 19) continue;
+            if (isSlotAvailable(nextSlot, busySlots, 60)) {
+              found = true;
+              break;
+            }
+          }
+          let sugerencia = found
+            ? `${nextSlot.toLocaleDateString('es-MX', { weekday: 'long', day: 'numeric', month: 'long' })} a las ${String(nextSlot.getHours()).padStart(2, '0')}:00`
+            : 'próximamente';
+          return {
+            reply: `⚠️ El horario que seleccionaste ya está ocupado. Te propongo: ${sugerencia}\n¿Te funciona ese horario?` ,
+            reservationRequest: false,
+            reservationData: {
+              ...reservationData,
+              suggestedDate: found ? nextSlot.toISOString().split('T')[0] : null,
+              suggestedTime: found ? `${String(nextSlot.getHours()).padStart(2, '0')}:00` : null
+            }
+          };
+        }
+        // Si está disponible, continuar
         session.inReservationFlow = false;
         session.awaitingAppointmentConfirmation = false;
         await saveSessionRedis(redis, userId, session);
@@ -296,8 +357,26 @@ Por ejemplo: "mañana a las 5pm" o "el viernes por la mañana`,
         address: detectedAddress || address || pending.address,
         clientEmail: detectedEmail || clientEmail || pending.clientEmail,
         preferredDate: preferedDate || pending.preferredDate,
-        preferredTime: preferedTime || pending.preferredTime
+        preferredTime: preferedTime || pending.preferredTime,
+        serviceType: serviceType || analysis.tipo_servicio || reservationData.serviceType
       };
+      // Mejor lógica: si el usuario responde con número, o con texto que coincide razonablemente con un slot sugerido, tomar ese slot
+      const suggestedSlots = session.suggestedSlots || [];
+      let selectedSlot = getSelectedSlotByIndex(userMessage, suggestedSlots);
+      if (!selectedSlot) {
+        // Intentar match flexible por texto (ej: "hoy a las 6 de la tarde")
+          selectedSlot = matchUserToSlot(userMessage, suggestedSlots);
+
+      }
+      if (selectedSlot) {
+        const date = new Date(selectedSlot.iso);
+        reservationData.preferredDate = date.toISOString().split('T')[0];
+        reservationData.preferredTime = date.toISOString().split('T')[1].slice(0,5);
+        await redis.setEx(preferedDateKey, 3600, reservationData.preferredDate);
+        await redis.setEx(preferedTimeKey, 3600, reservationData.preferredTime);
+        await redis.setEx(phaseKey, 900, 'phase2');
+        // 🔥 avanzar flujo
+      }
       const { missingPhase1, missingPhase2 } = buildMissing(reservationData);
       if (missingPhase1.length === 0 &&
         missingPhase2.length === 0 &&
@@ -390,7 +469,7 @@ Por ejemplo: "mañana a las 5pm" o "el viernes por la mañana`,
       }),
       timestamp: now.getTime()
     };
-    const busySlots = await getBusyTimes(); // 🔥 de Google Calendar
+    const busySlots = await getBusyTimes(); 
     const suggestedDates = await getMultipleSuggestedDates(busySlots, {
       limit: 3
     });
@@ -407,12 +486,11 @@ Por ejemplo: "mañana a las 5pm" o "el viernes por la mañana`,
       dateTime,
       suggestedText
     });
-    console.log('🧠 aiResponse:', aiResponse);
-console.log('🧠 tipo:', typeof aiResponse);
     const suggestsAppointment =
       /\b(agendar|agenda|visita|cita|programar)\b/i.test(aiResponse);
     if (suggestsAppointment && !reservationData) {
       session.awaitingAppointmentConfirmation = true;
+      console.log(session.awaitingAppointmentConfirmation);
       session.suggestedSlots  = suggestedDates.map((d, i) => ({
         index: i + 1,
         iso: d.toISOString()
@@ -429,6 +507,47 @@ console.log('🧠 tipo:', typeof aiResponse);
     return { reply: 'Ocurrió un error. Intenta nuevamente.' };
   }
 }
+
+function matchUserToSlot(userMessage, suggestedSlots) {
+  const msg = userMessage.toLowerCase();
+
+  const isToday = msg.includes('hoy');
+  const isTomorrow = msg.includes('mañana');
+
+  const hourMatch = msg.match(/\b(\d{1,2})\b/);
+  const userHour = hourMatch ? parseInt(hourMatch[1], 10) : null;
+
+  if (!userHour) return null;
+
+  return suggestedSlots.find(slot => {
+    const date = new Date(slot.iso);
+
+    const slotHour24 = date.getHours();
+    const slotHour12 = slotHour24 % 12 || 12;
+
+    const now = new Date();
+    const tomorrow = new Date();
+    tomorrow.setDate(now.getDate() + 1);
+
+    const isSlotToday =
+      date.toDateString() === now.toDateString();
+
+    const isSlotTomorrow =
+      date.toDateString() === tomorrow.toDateString();
+
+    // ✅ hora exacta
+    const hourMatch =
+      userHour === slotHour12 || userHour === slotHour24;
+
+    // ✅ contexto día (solo si lo mencionó)
+    const dayMatch =
+      (!isToday && !isTomorrow) ||
+      (isToday && isSlotToday) ||
+      (isTomorrow && isSlotTomorrow);
+
+    return hourMatch && dayMatch;
+  }) || null;
+}
 function getSelectedSlotByIndex(userMessage, suggestedSlots) {
   const match = userMessage.match(/\b(\d{1,2})\b/);
 
@@ -437,6 +556,56 @@ function getSelectedSlotByIndex(userMessage, suggestedSlots) {
   const index = parseInt(match[1], 10);
 
   return suggestedSlots.find(slot => slot.index === index) || null;
+}
+function isCDMXAddress(address) {
+  if (!address) return false;
+  const CDMX_ALCALDIAS = [
+  'alvaro obregon',
+  'azcapotzalco',
+  'benito juarez',
+  'coyoacan',
+  'cuajimalpa',
+  'cuauhtemoc',
+  'gustavo a madero',
+  'iztacalco',
+  'iztapalapa',
+  'magdalena contreras',
+  'miguel hidalgo',
+  'milpa alta',
+  'tlahuac',
+  'tlalpan',
+  'venustiano carranza',
+  'xochimilco'
+];
+  const text = address.toLowerCase();
+
+  // 🔹 1. Detectar CP
+  const cpMatch = text.match(/\b\d{5}\b/);
+  if (cpMatch) {
+    const cp = parseInt(cpMatch[0], 10);
+
+    // CP CDMX van aprox de 01000 a 16999
+    if (cp >= 1000 && cp <= 16999) {
+      return true;
+    }
+  }
+
+  // 🔹 2. Detectar alcaldía
+  const hasAlcaldia = CDMX_ALCALDIAS.some(alc =>
+    text.includes(alc)
+  );
+
+  if (hasAlcaldia) return true;
+
+  // 🔹 3. Detectar texto explícito
+  if (
+    text.includes('cdmx') ||
+    text.includes('ciudad de mexico')
+  ) {
+    return true;
+  }
+
+  return false;
 }
  async function getSessionRedis(redis, userId) {
   const sessionKey = `session:${userId}`;
@@ -464,21 +633,7 @@ async function saveSessionRedis(redis, userId, session) {
     JSON.stringify(session)
   );
 }
-async function getBusyTimes(auth) {
-  const calendar = await getGoogleCalendarInstance();
-  if (!calendar) throw new Error('Calendar no inicializado');
 
-  const response = await calendar.freebusy.query({
-    auth,
-    requestBody: {
-      timeMin: new Date().toISOString(),
-      timeMax: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(), // 7 días
-      items: [{ id: 'primary' }]
-    }
-  });
-
-  return response.data.calendars.primary.busy;
-}
 async function getMultipleSuggestedDates(
   busySlots,
   {

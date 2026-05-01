@@ -129,7 +129,7 @@ export const chatWithAI = async (req, res) => {
     // Extraer respuesta y datos de reservación si existen
     let response = aiResponse;
     let reservationResult = null;
-  
+    console.log('[DEBUG] Respuesta de IA:', aiResponse);
     if (
       typeof aiResponse === 'object' &&
       aiResponse.reservationRequest === true &&
