@@ -2,7 +2,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { getOpenAIInstance } from '../config/openai.config.js';
 import { getRedisClient } from '../config/redis.config.js';
-import { createGoogleCalendarEvent,getBusyTimes } from '../services/google-calendar.service.js';
+import { createGoogleCalendarEvent, getBusyTimes } from '../services/google-calendar.service.js';
 import e from 'cors';
 
 export async function generateAIResponse({ userMessage, conversationHistory = [], userId }) {
@@ -56,7 +56,7 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
 
     // 🔥 MEJOR DETECCIÓN DE DIRECCIÓN
     let detectedAddress = null;
-    
+
     // Caso con frase clara
     const addressMatch = userMessage.match(
       /(mi dirección es|vivo en|estoy en|me ubico en|queda en|ubicado en)\s+(.+)/i
@@ -93,25 +93,12 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
       await redis.setEx(clientEmailKey, 3600, detectedEmail);
     }
 
-    if (addressKey && detectedAddress) {
-      const isCDMX = isCDMXAddress(detectedAddress);
 
-      if (!isCDMX) {
-        return {
-          reply: `Para poder ayudarte mejor, por ahora solo trabajamos en Ciudad de México 📍  
-    ¿Tu proyecto se encuentra en CDMX?`,
-          reservationRequest: false,
-          reservationData: null
-        };
-      }
-
-      await redis.setEx(addressKey, 3600, detectedAddress);
-    }
     if (serviceTypeKey && analysis?.tipo_servicio) {
       await redis.setEx(serviceTypeKey, 3600, analysis.tipo_servicio);
     }
     // 🛑 CONTROL DE ONBOARDING
-       if (!clientName && !session.hasStarted) {
+    if (!clientName && !session.hasStarted) {
       session.hasStarted = true;
       await saveSessionRedis(redis, userId, session);
 
@@ -133,6 +120,23 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
       phase = 'phase1';
     }
     const address = addressKey ? await redis.get(addressKey) : null;
+    const expectingAddress =
+      phase === 'phase2' &&
+      !address;
+    if (addressKey && detectedAddress && expectingAddress) {
+      const isCDMX = isCDMXAddress(detectedAddress);
+
+      if (!isCDMX) {
+        return {
+          reply: `Para poder ayudarte mejor, por ahora solo trabajamos en Ciudad de México 📍  
+¿Tu proyecto se encuentra en CDMX?`,
+          reservationRequest: false,
+          reservationData: null
+        };
+      }
+
+      await redis.setEx(addressKey, 3600, detectedAddress);
+    }
     const preferedDate = preferedDateKey ? await redis.get(preferedDateKey) : null;
     const preferedTime = preferedTimeKey ? await redis.get(preferedTimeKey) : null;
     const confirmAppointment =
@@ -147,7 +151,12 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
     const intentType = revisarSiEsSolicitudDeReserva(lowerUserMessage);
     let reservationData = null;
 
-if (intentType === 'soft' && negativeSoft && !session.inReservationFlow) {
+    if (
+      intentType === 'soft' &&
+      negativeSoft &&
+      !session.inReservationFlow &&
+      !session.awaitingAppointmentConfirmation
+    ) {
       session.awaitingAppointmentConfirmation = true;
       session.inReservationFlow = false;
       await saveSessionRedis(redis, userId, session);
@@ -173,31 +182,82 @@ if (intentType === 'soft' && negativeSoft && !session.inReservationFlow) {
       )
     ) {
       reservationData = await detectAndExtractReservationData(userMessage, conversationHistory);
-      reservationData = {
-        ...reservationData,
-        clientName: clientName || reservationData.clientName,
-        clientEmail: clientEmail || reservationData.clientEmail,
-        address: address || reservationData.address,
-        serviceType: serviceType || analysis.tipo_servicio || reservationData.serviceType,
-        preferredDate: preferedDate || reservationData.preferredDate,
-        preferredTime: preferedTime || reservationData.preferredTime
-      };
+      reservationData = mergeReservationData({
+        base: reservationData,
+        extracted: reservationData, // aquí puede ser detectAndExtractReservationData
+        redisData: {
+          clientName,
+          clientEmail,
+          address,
+          serviceType,
+          preferredDate: preferedDate,
+          preferredTime: preferedTime
+        },
+        analysis
+      });
       const suggestedSlots = session.suggestedSlots || [];
       // Mejor lógica: si el usuario responde con número, o con texto que coincide razonablemente con un slot sugerido, tomar ese slot
       let selectedSlot = getSelectedSlotByIndex(userMessage, suggestedSlots);
+      console.log('[DEBUG] Slots sugeridos:', suggestedSlots);
       if (!selectedSlot) {
         // Intentar match flexible por texto (ej: "hoy a las 6 de la tarde")
-          selectedSlot = matchUserToSlot(userMessage, suggestedSlots);
+        selectedSlot = matchUserToSlot(userMessage, suggestedSlots);
+      }
 
+      if (!selectedSlot) {
+        const busySlots = await getBusyTimes();
+        const customSlot = tryCustomSlot(userMessage, busySlots);
+
+        if (customSlot?.invalid) {
+          if (customSlot.reason === 'outside_working_hours') {
+            return {
+              reply: `Nuestro horario de atención es de 9:00 a 19:00. ¿Qué hora te funciona dentro de ese rango?`,
+              reservationRequest: false,
+              reservationData
+            };
+          }
+
+          if (customSlot.reason === 'busy') {
+            return {
+              reply: `Ese horario ya está ocupado. ¿Quieres que te comparta algunas opciones disponibles?`,
+              reservationRequest: false,
+              reservationData
+            };
+          }
+        }
+
+        if (customSlot) {
+          // El usuario propuso un horario alternativo válido
+          selectedSlot = customSlot;
+          // Limpiar los slots sugeridos previos, ya no son obligatorios
+          session.suggestedSlots = [];
+          await saveSessionRedis(redis, userId, session);
+          console.log('[DEBUG] Slot personalizado detectado y sugerencias limpiadas:', selectedSlot);
+        }
       }
       if (selectedSlot) {
         const date = new Date(selectedSlot.iso);
+        console.log('[DEBUG] Slot seleccionado por el usuario:', date);
         reservationData.preferredDate = date.toISOString().split('T')[0];
-        reservationData.preferredTime = date.toISOString().split('T')[1].slice(0,5);
+        reservationData.preferredTime = date.toISOString().split('T')[1].slice(0, 5);
         await redis.setEx(preferedDateKey, 3600, reservationData.preferredDate);
         await redis.setEx(preferedTimeKey, 3600, reservationData.preferredTime);
         await redis.setEx(phaseKey, 900, 'phase2');
+        console.log(`[DEBUG] Avanzando a fase 2  ${reservationData.topreferredDate} ${reservationData.preferredTime}`);
         // 🔥 avanzar flujo
+        // Guardar reservationData actualizado en pendingReservationKey para que la siguiente vuelta muestre correctamente los datos faltantes
+        if (pendingReservationKey && reservationData && typeof reservationData === 'object') {
+          await redis.setEx(
+            pendingReservationKey,
+            900,
+            JSON.stringify(reservationData)
+          );
+        }
+        // Si el slot es personalizado, limpiar sugerencias para que no sean obligatorias
+        if (selectedSlot.custom) {
+          session.suggestedSlots = [];
+          await saveSessionRedis(redis, userId, session);
+        }
       }
       if (revisarConfirmacion) {
         session.awaitingAppointmentConfirmation = false;
@@ -226,10 +286,11 @@ if (intentType === 'soft' && negativeSoft && !session.inReservationFlow) {
               0, 0
             );
           }
-        } catch (e) {}
+        } catch (e) { }
         let slotOk = false;
         if (slotDateTime) {
           slotOk = isSlotAvailable(slotDateTime, busySlots, 60);
+          console.log(`[DEBUG] Validando slot ${slotDateTime.toISOString()} - Disponible: ${slotOk}`);
         }
         // 🔎 DEBUG: Mostrar reservationData antes de confirmar
         console.log('[DEBUG][RESERVATION] reservationData final:', JSON.stringify(reservationData, null, 2));
@@ -249,7 +310,7 @@ if (intentType === 'soft' && negativeSoft && !session.inReservationFlow) {
             ? `${nextSlot.toLocaleDateString('es-MX', { weekday: 'long', day: 'numeric', month: 'long' })} a las ${String(nextSlot.getHours()).padStart(2, '0')}:00`
             : 'próximamente';
           return {
-            reply: `⚠️ El horario que seleccionaste ya está ocupado. Te propongo: ${sugerencia}\n¿Te funciona ese horario?` ,
+            reply: `⚠️ El horario que seleccionaste ya está ocupado. Te propongo: ${sugerencia}\n¿Te funciona ese horario?`,
             reservationRequest: false,
             reservationData: {
               ...reservationData,
@@ -350,32 +411,72 @@ Por ejemplo: "mañana a las 5pm" o "el viernes por la mañana`,
 
       const extracted = await detectAndExtractReservationData(userMessage, conversationHistory);
 
-      reservationData = {
-        ...pending,
-        ...extracted,
-        clientName: detectedName || clientName || pending.clientName,
-        address: detectedAddress || address || pending.address,
-        clientEmail: detectedEmail || clientEmail || pending.clientEmail,
-        preferredDate: preferedDate || pending.preferredDate,
-        preferredTime: preferedTime || pending.preferredTime,
-        serviceType: serviceType || analysis.tipo_servicio || reservationData.serviceType
-      };
+      reservationData = mergeReservationData({
+        base: reservationData,
+        extracted: reservationData, // aquí puede ser detectAndExtractReservationData
+        redisData: {
+          clientName,
+          clientEmail,
+          address,
+          serviceType,
+          preferredDate: preferedDate,
+          preferredTime: preferedTime
+        },
+        analysis
+      });
       // Mejor lógica: si el usuario responde con número, o con texto que coincide razonablemente con un slot sugerido, tomar ese slot
       const suggestedSlots = session.suggestedSlots || [];
       let selectedSlot = getSelectedSlotByIndex(userMessage, suggestedSlots);
       if (!selectedSlot) {
         // Intentar match flexible por texto (ej: "hoy a las 6 de la tarde")
-          selectedSlot = matchUserToSlot(userMessage, suggestedSlots);
+        selectedSlot = matchUserToSlot(userMessage, suggestedSlots);
 
+      }
+
+      if (!selectedSlot) {
+        const busySlots = await getBusyTimes();
+        const customSlot = tryCustomSlot(userMessage, busySlots);
+
+        if (customSlot?.invalid) {
+          if (customSlot.reason === 'outside_working_hours') {
+            return {
+              reply: `Nuestro horario de atención es de 9:00 a 19:00. ¿Qué hora te funciona dentro de ese rango?`,
+              reservationRequest: false,
+              reservationData
+            };
+          }
+
+          if (customSlot.reason === 'busy') {
+            return {
+              reply: `Ese horario ya está ocupado. ¿Quieres que te comparta algunas opciones disponibles?`,
+              reservationRequest: false,
+              reservationData
+            };
+          }
+        }
+
+        if (customSlot) {
+          // El usuario propuso un horario alternativo válido
+          selectedSlot = customSlot;
+          // Limpiar los slots sugeridos previos, ya no son obligatorios
+          session.suggestedSlots = [];
+          await saveSessionRedis(redis, userId, session);
+          console.log('[DEBUG] Slot personalizado detectado y sugerencias limpiadas:', selectedSlot);
+        }
       }
       if (selectedSlot) {
         const date = new Date(selectedSlot.iso);
         reservationData.preferredDate = date.toISOString().split('T')[0];
-        reservationData.preferredTime = date.toISOString().split('T')[1].slice(0,5);
+        reservationData.preferredTime = date.toISOString().split('T')[1].slice(0, 5);
         await redis.setEx(preferedDateKey, 3600, reservationData.preferredDate);
         await redis.setEx(preferedTimeKey, 3600, reservationData.preferredTime);
         await redis.setEx(phaseKey, 900, 'phase2');
         // 🔥 avanzar flujo
+        // Si el slot es personalizado, limpiar sugerencias para que no sean obligatorias
+        if (selectedSlot.custom) {
+          session.suggestedSlots = [];
+          await saveSessionRedis(redis, userId, session);
+        }
       }
       const { missingPhase1, missingPhase2 } = buildMissing(reservationData);
       if (missingPhase1.length === 0 &&
@@ -469,7 +570,7 @@ Por ejemplo: "mañana a las 5pm" o "el viernes por la mañana`,
       }),
       timestamp: now.getTime()
     };
-    const busySlots = await getBusyTimes(); 
+    const busySlots = await getBusyTimes();
     const suggestedDates = await getMultipleSuggestedDates(busySlots, {
       limit: 3
     });
@@ -491,10 +592,12 @@ Por ejemplo: "mañana a las 5pm" o "el viernes por la mañana`,
     if (suggestsAppointment && !reservationData) {
       session.awaitingAppointmentConfirmation = true;
       console.log(session.awaitingAppointmentConfirmation);
-      session.suggestedSlots  = suggestedDates.map((d, i) => ({
-        index: i + 1,
-        iso: d.toISOString()
-      }));
+      if (!session.suggestedSlots || session.suggestedSlots.length === 0) {
+        session.suggestedSlots = suggestedDates.map((d, i) => ({
+          index: i + 1,
+          iso: d.toISOString()
+        }));
+      }
       await saveSessionRedis(redis, userId, session);
     }
     return {
@@ -548,6 +651,120 @@ function matchUserToSlot(userMessage, suggestedSlots) {
     return hourMatch && dayMatch;
   }) || null;
 }
+function tryCustomSlot(userMessage, busySlots, {
+  workStart = 9,
+  workEnd = 19,
+  durationMinutes = 60
+} = {}) {
+
+  const msg = userMessage.toLowerCase();
+
+  // Buscar la hora solo después de frases como 'a las', 'a la', 'a'
+  // Ejemplo: 'lunes 4 de mayo a las 10 de la mañana'
+  let hourMatch = null;
+  const horaRegexes = [
+    /a\s+las\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i,
+    /a\s+la\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i,
+    /a\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i
+  ];
+  for (const regex of horaRegexes) {
+    const match = msg.match(regex);
+    if (match) {
+      hourMatch = match;
+      break;
+    }
+  }
+  // Si no se encontró con los patrones, usar el primer número como fallback (comportamiento anterior)
+  if (!hourMatch) {
+    hourMatch = msg.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i);
+  }
+  if (!hourMatch) return null;
+
+  let hour = parseInt(hourMatch[1], 10);
+  const minute = hourMatch[2] ? parseInt(hourMatch[2], 10) : 0;
+  let meridiem = hourMatch[3]?.toLowerCase();
+
+  // Heurística textual para "de la mañana", "de la tarde", "de la noche"
+  if (!meridiem) {
+    if (/de la ma\u00f1ana/.test(msg) || /en la ma\u00f1ana/.test(msg)) {
+      meridiem = 'am';
+    } else if (/de la tarde/.test(msg) || /en la tarde/.test(msg)) {
+      meridiem = 'pm';
+    } else if (/de la noche/.test(msg) || /en la noche/.test(msg)) {
+      // Si es "de la noche" y la hora es <= 7, forzar pm (19:00 máximo)
+      meridiem = 'pm';
+      if (hour > 19) hour = 19;
+    }
+  }
+
+  if (meridiem === 'pm' && hour < 12) hour += 12;
+  if (meridiem === 'am' && hour === 12) hour = 0;
+
+  if (hour < 0 || hour > 23) return null;
+
+  const now = new Date();
+  const slot = new Date(now);
+
+  if (msg.includes('lunes')) {
+    // Si el usuario menciona un día específico, ajustar la fecha al próximo lunes
+    const dayOfWeek = 1; // Lunes = 1 (domingo = 0)
+    const diff = (7 + dayOfWeek - slot.getDay()) % 7 || 7;
+    slot.setDate(slot.getDate() + diff);
+  } else if (msg.includes('martes')) {
+    const dayOfWeek = 2;
+    const diff = (7 + dayOfWeek - slot.getDay()) % 7 || 7;
+    slot.setDate(slot.getDate() + diff);
+  } else if (msg.includes('miércoles') || msg.includes('miercoles')) {
+    const dayOfWeek = 3;
+    const diff = (7 + dayOfWeek - slot.getDay()) % 7 || 7;
+    slot.setDate(slot.getDate() + diff);
+  } else if (msg.includes('jueves')) {
+    const dayOfWeek = 4;
+    const diff = (7 + dayOfWeek - slot.getDay()) % 7 || 7;
+    slot.setDate(slot.getDate() + diff);
+  } else if (msg.includes('viernes')) {
+    const dayOfWeek = 5;
+    const diff = (7 + dayOfWeek - slot.getDay()) % 7 || 7;
+    slot.setDate(slot.getDate() + diff);
+  } else if (msg.includes('sábado') || msg.includes('sabado')) {
+    const dayOfWeek = 6;
+    const diff = (7 + dayOfWeek - slot.getDay()) % 7 || 7;
+    slot.setDate(slot.getDate() + diff);
+  } else if (msg.includes('domingo')) {
+    const dayOfWeek = 0;
+    const diff = (7 + dayOfWeek - slot.getDay()) % 7 || 7;
+    slot.setDate(slot.getDate() + diff);
+  } else if (msg.includes('mañana')) {
+    slot.setDate(slot.getDate() + 1);
+  }
+
+  slot.setHours(hour, minute, 0, 0);
+
+  if (!msg.includes('mañana') && !/lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo/.test(msg) && slot < now) {
+    slot.setDate(slot.getDate() + 1);
+  }
+
+  if (slot.getHours() < workStart || slot.getHours() > workEnd) {
+    return {
+      invalid: true,
+      reason: 'outside_working_hours'
+    };
+  }
+
+  const available = isSlotAvailable(slot, busySlots, durationMinutes);
+
+  if (!available) {
+    return {
+      invalid: true,
+      reason: 'busy'
+    };
+  }
+
+  return {
+    iso: slot.toISOString(),
+    custom: true
+  };
+}
 function getSelectedSlotByIndex(userMessage, suggestedSlots) {
   const match = userMessage.match(/\b(\d{1,2})\b/);
 
@@ -560,23 +777,23 @@ function getSelectedSlotByIndex(userMessage, suggestedSlots) {
 function isCDMXAddress(address) {
   if (!address) return false;
   const CDMX_ALCALDIAS = [
-  'alvaro obregon',
-  'azcapotzalco',
-  'benito juarez',
-  'coyoacan',
-  'cuajimalpa',
-  'cuauhtemoc',
-  'gustavo a madero',
-  'iztacalco',
-  'iztapalapa',
-  'magdalena contreras',
-  'miguel hidalgo',
-  'milpa alta',
-  'tlahuac',
-  'tlalpan',
-  'venustiano carranza',
-  'xochimilco'
-];
+    'alvaro obregon',
+    'azcapotzalco',
+    'benito juarez',
+    'coyoacan',
+    'cuajimalpa',
+    'cuauhtemoc',
+    'gustavo a madero',
+    'iztacalco',
+    'iztapalapa',
+    'magdalena contreras',
+    'miguel hidalgo',
+    'milpa alta',
+    'tlahuac',
+    'tlalpan',
+    'venustiano carranza',
+    'xochimilco'
+  ];
   const text = address.toLowerCase();
 
   // 🔹 1. Detectar CP
@@ -585,9 +802,8 @@ function isCDMXAddress(address) {
     const cp = parseInt(cpMatch[0], 10);
 
     // CP CDMX van aprox de 01000 a 16999
-    if (cp >= 1000 && cp <= 16999) {
-      return true;
-    }
+    if (cp >= 10000 && cp <= 16999) return true;
+
   }
 
   // 🔹 2. Detectar alcaldía
@@ -607,15 +823,15 @@ function isCDMXAddress(address) {
 
   return false;
 }
- async function getSessionRedis(redis, userId) {
+async function getSessionRedis(redis, userId) {
   const sessionKey = `session:${userId}`;
   const sessionStr = await redis.get(sessionKey);
 
   if (!sessionStr) {
     return {
       awaitingAppointmentConfirmation: false,
-      suggestedSlots : [],
-      inReservationFlow : false,
+      suggestedSlots: [],
+      inReservationFlow: false,
       hasStarted: false,
       lastBotMessage: null
     };
@@ -688,14 +904,14 @@ async function getMultipleSuggestedDates(
   }
 
   return suggestions; // 👈 ARRAY de fechas
-}function formatMultipleSuggestedDates(dates) {
+} function formatMultipleSuggestedDates(dates) {
   return dates
     .map((date, i) => {
       const label = i === 0
         ? 'Primera opción'
         : i === 1
-        ? 'Otra opción'
-        : 'También disponible';
+          ? 'Otra opción'
+          : 'También disponible';
 
       return `${i + 1}. ${label}: ${formatSuggestedDate(date)}`;
     })
@@ -788,7 +1004,26 @@ function revisarSiEsSolicitudDeReserva(userMessage) {
 
   return 'none';
 }
-
+function mergeReservationData({
+  base,
+  detected,
+  redisData,
+  analysis
+}) {
+  return {
+    ...base,
+    ...detected,
+    clientName: redisData.clientName || base.clientName,
+    address: redisData.address || base.address,
+    clientEmail: redisData.clientEmail || base.clientEmail,
+    serviceType:
+      redisData.serviceType ||
+      base.serviceType ||
+      detected.serviceType ||
+      analysis?.tipo_servicio ||
+      null
+  };
+}
 /**
  * Analiza el mensaje de un usuario y devuelve:
  * - Intención del usuario
