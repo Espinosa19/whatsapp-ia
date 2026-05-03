@@ -4,6 +4,7 @@ import { getOpenAIInstance } from '../config/openai.config.js';
 import { getRedisClient } from '../config/redis.config.js';
 import { createGoogleCalendarEvent, getBusyTimes } from '../services/google-calendar.service.js';
 import e from 'cors';
+import { json } from 'stream/consumers';
 
 export async function generateAIResponse({ userMessage, conversationHistory = [], userId }) {
   try {
@@ -24,6 +25,32 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
     const pendingReservationKey = userId ? `pendingReservation:${userId}` : null;
     const phaseKey = `reservationPhase:${userId}`;
     const session = await getSessionRedis(redis, userId);
+
+    // =========================
+    // 🔵 FLUJO DE CONFIRMACIÓN DE VISITA TÉCNICA PENDIENTE
+    // =========================
+    // Si existe una visita técnica pendiente y el usuario responde afirmativamente,
+    // avanzar inmediatamente a fase 2 y pedir datos de agenda
+    const simpleConfirmation =
+      /^(si|sí|ok|vale|va|dale|perfecto|me parece|claro|por favor|hazlo|agendalo|agéndalo|de acuerdo|me parece bien)$/i
+        .test(userMessage.trim().toLowerCase());
+
+    if (session.pendingTechnicalVisitConfirmation && simpleConfirmation) {
+      // Limpiar el flag y avanzar a fase 2
+      session.pendingTechnicalVisitConfirmation = false;
+      session.awaitingAppointmentConfirmation = false;
+      session.inReservationFlow = true;
+      await saveSessionRedis(redis, userId, session);
+      await redis.setEx(`reservationPhase:${userId}`, 900, 'phase2');
+
+      return {
+        reply: `¡Perfecto! 👍 Vamos a agendar tu visita técnica.\nSolo dime qué día y a qué hora te queda mejor 📅⏰\nPor ejemplo: "mañana a las 5pm" o "el viernes por la mañana"`,
+        reservationRequest: false,
+        reservationData: {
+          missingData: ["Fecha", "Hora"]
+        }
+      };
+    }
     const preferedDateKey = userId ? `preferedDate:${userId}` : null;
     const preferedTimeKey = userId ? `preferedTime:${userId}` : null;
     const serviceTypeKey = userId ? `serviceType:${userId}` : null;
@@ -142,9 +169,7 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
     const confirmAppointment =
       /\b(si|sí|ok|vale|va|dale|perfecto|me parece|claro|por favor|hazlo|agendalo|agéndalo)\b.*\b(cita|visita|agendar|agenda|programar|ir)\b/i
         .test(lowerUserMessage);
-    const simpleConfirmation =
-      /^(si|sí|ok|vale|va|dale|perfecto|me parece|claro|por favor|hazlo|agendalo|agéndalo)$/i
-        .test(lowerUserMessage.trim());
+    // (La nueva validación de confirmación se movió arriba para priorizar el flujo)
     const negativeSoft =
       /(precio|cotización|información|info|solo estoy viendo|comparando|quiero saber)/i
         .test(lowerUserMessage);
@@ -155,10 +180,12 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
       intentType === 'soft' &&
       negativeSoft &&
       !session.inReservationFlow &&
-      !session.awaitingAppointmentConfirmation
+      !session.awaitingAppointmentConfirmation &&
+      !session.pendingTechnicalVisitConfirmation
     ) {
       session.awaitingAppointmentConfirmation = true;
       session.inReservationFlow = false;
+      session.pendingTechnicalVisitConfirmation = true; // 🔵 Activar flag explícito
       await saveSessionRedis(redis, userId, session);
       return {
         reply: `Entiendo que estás buscando información. ¿Quieres que te ayude a agendar una visita técnica para revisar tu caso?`,
@@ -182,9 +209,13 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
       )
     ) {
       reservationData = await detectAndExtractReservationData(userMessage, conversationHistory);
+      console.log('[DEBUG][RESERVA] Tras extracción:', {
+        preferredDate: reservationData?.preferredDate,
+        preferredTime: reservationData?.preferredTime
+      });
       reservationData = mergeReservationData({
         base: reservationData,
-        extracted: reservationData, // aquí puede ser detectAndExtractReservationData
+        detected: reservationData, // aquí puede ser detectAndExtractReservationData
         redisData: {
           clientName,
           clientEmail,
@@ -194,6 +225,10 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
           preferredTime: preferedTime
         },
         analysis
+      });
+      console.log('[DEBUG][RESERVA] Tras merge:', {
+        preferredDate: reservationData?.preferredDate,
+        preferredTime: reservationData?.preferredTime
       });
       const suggestedSlots = session.suggestedSlots || [];
       // Mejor lógica: si el usuario responde con número, o con texto que coincide razonablemente con un slot sugerido, tomar ese slot
@@ -243,7 +278,7 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
         await redis.setEx(preferedDateKey, 3600, reservationData.preferredDate);
         await redis.setEx(preferedTimeKey, 3600, reservationData.preferredTime);
         await redis.setEx(phaseKey, 900, 'phase2');
-        console.log(`[DEBUG] Avanzando a fase 2  ${reservationData.topreferredDate} ${reservationData.preferredTime}`);
+        console.log(`[DEBUG] Avanzando a fase 2  ${reservationData.preferredDate} ${reservationData.preferredTime}`);
         // 🔥 avanzar flujo
         // Guardar reservationData actualizado en pendingReservationKey para que la siguiente vuelta muestre correctamente los datos faltantes
         if (pendingReservationKey && reservationData && typeof reservationData === 'object') {
@@ -265,11 +300,20 @@ export async function generateAIResponse({ userMessage, conversationHistory = []
         await saveSessionRedis(redis, userId, session);
       }
       const { missingPhase1, missingPhase2 } = buildMissing(reservationData);
-      if (
-        missingPhase1.length === 0 &&
-        missingPhase2.length === 0 &&
-        reservationData.shouldReserve
-      ) {
+      // --- NUEVO: Validación determinística de campos obligatorios ---
+      const requiredFields = [
+        reservationData.clientName,
+        reservationData.serviceType,
+        reservationData.address,
+        reservationData.preferredDate,
+        reservationData.preferredTime
+      ];
+      console.log('[DEBUG] Validación de campos obligatorios:', JSON.stringify(requiredFields, null, 2));
+      const allRequiredPresent = requiredFields.every(Boolean);
+      if (missingPhase1.length === 0 && missingPhase2.length === 0 && allRequiredPresent) {
+        // Forzar flags
+        reservationData.shouldReserve = true;
+        reservationData.confidence = 1;
         // 🔒 Validación reforzada de disponibilidad
         const busySlots = await getBusyTimes();
         let slotDateTime = null;
@@ -411,9 +455,13 @@ Por ejemplo: "mañana a las 5pm" o "el viernes por la mañana`,
 
       const extracted = await detectAndExtractReservationData(userMessage, conversationHistory);
 
+      console.log('[DEBUG][RESERVA][PENDING] Tras extracción:', {
+        preferredDate: reservationData?.preferredDate,
+        preferredTime: reservationData?.preferredTime
+      });
       reservationData = mergeReservationData({
         base: reservationData,
-        extracted: reservationData, // aquí puede ser detectAndExtractReservationData
+        detected: reservationData, // aquí puede ser detectAndExtractReservationData
         redisData: {
           clientName,
           clientEmail,
@@ -423,6 +471,10 @@ Por ejemplo: "mañana a las 5pm" o "el viernes por la mañana`,
           preferredTime: preferedTime
         },
         analysis
+      });
+      console.log('[DEBUG][RESERVA][PENDING] Tras merge:', {
+        preferredDate: reservationData?.preferredDate,
+        preferredTime: reservationData?.preferredTime
       });
       // Mejor lógica: si el usuario responde con número, o con texto que coincide razonablemente con un slot sugerido, tomar ese slot
       const suggestedSlots = session.suggestedSlots || [];
@@ -560,7 +612,10 @@ Por ejemplo: "mañana a las 5pm" o "el viernes por la mañana`,
 
     }
     const now = new Date();
-
+    console.log(
+      '[DEBUG] reservationData:',
+      JSON.stringify(reservationData, null, 2)
+    );
     const dateTime = {
       date: now.toLocaleDateString('en-CA'), // formato ISO local
       time: now.toLocaleTimeString('es-MX', {
@@ -1010,7 +1065,17 @@ function mergeReservationData({
   redisData,
   analysis
 }) {
-  return {
+  // LOG: Antes del merge
+  console.log('[DEBUG][MERGE] Antes:', {
+    basePreferredDate: base?.preferredDate,
+    detectedPreferredDate: detected?.preferredDate,
+    redisPreferredDate: redisData?.preferredDate,
+    basePreferredTime: base?.preferredTime,
+    detectedPreferredTime: detected?.preferredTime,
+    redisPreferredTime: redisData?.preferredTime
+  });
+
+  const merged = {
     ...base,
     ...detected,
     clientName: redisData.clientName || base.clientName,
@@ -1021,8 +1086,18 @@ function mergeReservationData({
       base.serviceType ||
       detected.serviceType ||
       analysis?.tipo_servicio ||
-      null
+      null,
+    // --- Corrección: asegurar que preferredDate y preferredTime sobreviven ---
+    preferredDate: redisData.preferredDate || detected.preferredDate || base.preferredDate || null,
+    preferredTime: redisData.preferredTime || detected.preferredTime || base.preferredTime || null
   };
+
+  // LOG: Después del merge
+  console.log('[DEBUG][MERGE] Después:', {
+    preferredDate: merged.preferredDate,
+    preferredTime: merged.preferredTime
+  });
+  return merged;
 }
 /**
  * Analiza el mensaje de un usuario y devuelve:
@@ -1623,6 +1698,12 @@ export function validateAndFormatReservationData(data, existingAppointments = []
           suggestedDateTime: suggestedDateTime.toISOString(),
         };
       }
+      let dataDate =null;
+      if (isNaN(Date.parse(data.preferredDate))) {
+        const [year, month, day] = data.preferredDate.split('-');
+        dataDate = new Date(parseInt(year), parseInt(month) - 1, parseInt(day));
+      } 
+      
 
     } catch (error) {
       console.error('❌ Error parseando fecha/hora:', error);
@@ -1632,78 +1713,27 @@ export function validateAndFormatReservationData(data, existingAppointments = []
       };
     }
 
-    // ✅ 7. NUEVA VALIDACIÓN: Verificar que no exista otra cita en la misma hora
-    console.log('🔄 Verificando disponibilidad de horario...');
-    if (existingAppointments && existingAppointments.length > 0) {
-      const BUFFER = 60 * 60 * 1000; // 1 hora de buffer
-      const requestedTime = dateTime.getTime();
-
-      const conflictingAppointment = existingAppointments.find(appt => {
-        const existingTime = new Date(appt.dateTime).getTime();
-        const timeDifference = Math.abs(existingTime - requestedTime);
-        return timeDifference < BUFFER;
-      });
-
-      if (conflictingAppointment) {
-        console.warn('❌ Horario ocupado:', {
-          solicitado: dateTime.toLocaleString('es-MX'),
-          existente: new Date(conflictingAppointment.dateTime).toLocaleString('es-MX')
-        });
-
-        // Sugerir próximo horario disponible (solo bloques válidos entre 9-19)
-        let suggestedTime = new Date(dateTime);
-        let found = false;
-
-        for (let i = 1; i <= 10; i++) {
-          suggestedTime.setHours(suggestedTime.getHours() + 1);
-
-          // Solo considerar si está dentro del horario 9-19
-          if (suggestedTime.getHours() < 9 || suggestedTime.getHours() > 19) {
-            continue;
-          }
-
-          const suggestedTimeMs = suggestedTime.getTime();
-
-          const isAvailable = !existingAppointments.some(appt => {
-            const existingTime = new Date(appt.dateTime).getTime();
-            return Math.abs(existingTime - suggestedTimeMs) < BUFFER;
-          });
-
-          if (isAvailable) {
-            found = true;
-            break;
-          }
-        }
-
-        const suggestedTimeStr = found
-          ? suggestedTime.toLocaleString('es-MX', { dateStyle: 'medium', timeStyle: 'short' })
-          : 'próximamente';
-
-        return {
-          valid: false,
-          error: `⚠️ Ese horario ya está ocupado.\n\nTe propongo: ${suggestedTimeStr}\n\n¿Te funciona ese horario?`,
-          conflict: true,
-          suggestedDateTime: found ? suggestedTime.toISOString() : null
-        };
-      }
-
-      console.log('✅ Horario disponible ✓');
-    }
+    
 
     console.log('✅ TODAS LAS VALIDACIONES PASARON');
     return {
       valid: true,
       formatted: {
-        clientName: data.clientName,
-        clientPhone: data.clientPhone || '',
-        clientEmail: data.clientEmail || '',
-        serviceType: data.serviceType,
-        address: data.address,
-        city: data.city,
-        dateTime: dateTime.toISOString(),
-        notes: data.notes || '',
-        duration: 60, // Duración por defecto
-      },
+      clientName: data.clientName,
+      clientPhone: data.clientPhone || '',
+      clientEmail: data.clientEmail || '',
+      serviceType: data.serviceType,
+      address: data.address,
+      city: data.city,
+
+      preferredDate: data.preferredDate,
+      preferredTime: data.preferredTime,
+
+      dateTime: dateTime.toISOString(),
+
+      notes: data.notes || '',
+      duration: 60,
+    },
     };
   } catch (error) {
     console.error('❌ Error validando datos de reservación:', error);

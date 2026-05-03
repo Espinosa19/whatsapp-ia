@@ -137,17 +137,16 @@ export const chatWithAI = async (req, res) => {
     ) {
       logInfo('Solicitud de reservación detectada', 'chatWithAI');
       response = aiResponse.reply;
-      
+
       // 📅 Procesar solicitud de reservación
       if (aiResponse.reservationData && aiResponse.reservationData.shouldReserve) {
-        
         logInfo('Validando datos de reservación', 'chatWithAI');
 
         const notes = await generateNotesWithAI(conversationHistory);
         const existingReservations = await getUserReservations(userIdentifier);
         const enrichedData = {
           ...aiResponse.reservationData,
-          notes: notes|| '',
+          notes: notes || '',
         };
 
         const validation = validateAndFormatReservationData(
@@ -164,7 +163,30 @@ export const chatWithAI = async (req, res) => {
 
           if (reservationResult.success) {
             logSuccess(`Reservación creada para ${validation.formatted.clientName}`, 'chatWithAI');
-            // 🔥 GUARDAR LEAD CUANDO LA RESERVACIÓN ES EXITOSA
+            const redis = await getRedisClient();
+
+            if (redis) {
+              await redis.del(`reservationPhase:${userIdentifier}`);
+              await redis.del(`pendingReservation:${userIdentifier}`);
+
+              const sessionKey = `session:${userIdentifier}`;
+              const sessionStr = await redis.get(sessionKey);
+
+              if (sessionStr) {
+                const session = JSON.parse(sessionStr);
+
+                session.inReservationFlow = false;
+                session.awaitingAppointmentConfirmation = false;
+                session.pendingTechnicalVisitConfirmation = false;
+                session.suggestedSlots = [];
+
+                await redis.setEx(
+                  sessionKey,
+                  3600,
+                  JSON.stringify(session)
+                );
+              }
+            }
             try {
               saveLead({
                 userId: userIdentifier,
@@ -176,8 +198,8 @@ export const chatWithAI = async (req, res) => {
                 city: validation.formatted.city,
                 status: 'convertido',
                 notes: validation.formatted.notes,
-                preferredDate: validation.formatted.dateTime.split('T')[0],
-                preferredTime: validation.formatted.dateTime.split('T')[1].substring(0, 5),
+                preferredDate: validation.formatted.preferredDate,
+                preferredTime: validation.formatted.preferredTime,
                 eventId: reservationResult.eventId,
                 calendarLink: reservationResult.eventLink,
               });
@@ -186,8 +208,9 @@ export const chatWithAI = async (req, res) => {
               logError(leadError, 'saveLead');
             }
 
+            // Solo aquí, tras éxito real, armar mensaje de confirmación
             response += `\n\n✅ *RESERVACIÓN CONFIRMADA*\n`;
-            response += `� Fecha: ${new Date(reservationResult.reservation.dateTime).toLocaleDateString('es-MX')}\n`;
+            response += `📅 Fecha: ${new Date(reservationResult.reservation.dateTime).toLocaleDateString('es-MX')}\n`;
             response += `⏰ Hora: ${new Date(reservationResult.reservation.dateTime).toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' })}\n`;
             response += `📍 Ubicación: ${reservationResult.reservation.address}\n`;
           } else {
